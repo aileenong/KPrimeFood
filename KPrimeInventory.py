@@ -237,7 +237,7 @@ def import_items_and_add_or_insert():
 import fitz
 import os
 
-def generate_soa_pdf(customer_name, customer_id, start_date, end_date, soa_df, logo_path="kprime.jpg"):
+def generate_soa_pdf(customer_name, customer_id, start_date, end_date, soa_df, logo_path="KPrime.jpg"):
     pdf_filename = f"statement_customer_{customer_id}_{customer_name}.pdf"
     doc = fitz.open()
 
@@ -388,14 +388,16 @@ def logout():
 
 # ---------------- LOGIN PAGE ----------------
 if not st.session_state.logged_in:
-    if os.path.exists("kprime.jpg"):
-        st.image("Kprime.jpg", width=250)
-    st.title("Welcome to Steak Haven Inventory")
+    if os.path.exists("KPrime.jpg"):
+        st.image("KPrime.jpg", width=250)
+    else:
+        st.write("Logo not available")
+    st.title("Welcome to KPrime Food Solutions")
     st.write("Your choice for premium quality meat")
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
     if st.button("Login"):
-        if username == "admin" and password == "1234":
+        if (username == "admin" or username == "Admin") and password == "1234":
             st.session_state.logged_in = True
             st.session_state.menu = "Home"
             st.session_state.username = username
@@ -784,4 +786,5 @@ elif st.session_state.logged_in:
                     st.write("**After Change:**")
                     st.dataframe(after_sales)
             conn.close()
+
 
