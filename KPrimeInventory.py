@@ -1,10 +1,29 @@
-
 import streamlit as st
+from streamlit_option_menu import option_menu
 import sqlite3
+import qrcode
 import pandas as pd
 import plotly.express as px
 import fitz  # PyMuPDF for PDF generation
 import os
+import io
+import base64
+import cv2
+from pyzbar.pyzbar import decode
+import datetime
+from datetime import datetime
+from datetime import date
+import calendar
+
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+)
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfgen import canvas
+
 
 # ---------------- SESSION STATE INIT ----------------
 if 'logged_in' not in st.session_state:
@@ -22,25 +41,27 @@ def create_tables():
     conn = get_connection()
     conn.execute("""
     CREATE TABLE IF NOT EXISTS items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item TEXT,
+        item_id INTEGER PRIMARY KEY AUTOINCREMENT,  
+        item_name TEXT,
         category TEXT,
         quantity INTEGER,
-        unit_cost REAL,
-        selling_price REAL
+        fridge_no INTEGER
     )
     """)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item TEXT,
+        item_id INTEGER NOT NULL,
+        item_name TEXT,
         quantity INTEGER,
         selling_price REAL,
         total_sale REAL,
         cost REAL,
         profit REAL,
         date TEXT,
-        customer_id INTEGER
+        customer_id INTEGER,
+        overridden INTEGER DEFAULT 0,
+        FOREIGN KEY (item_id) REFERENCES items(item_id)
     )
     """)
     conn.execute("""
@@ -55,7 +76,7 @@ def create_tables():
     conn.execute("""
     CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item TEXT,
+        item_name TEXT,
         category TEXT,
         action TEXT,
         quantity INTEGER,
@@ -63,6 +84,17 @@ def create_tables():
         selling_price REAL,
         user TEXT,
         timestamp TEXT
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pricing_tiers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL,
+    min_qty INTEGER NOT NULL,
+    max_qty INTEGER,  -- NULL means no upper limit
+    price_per_unit REAL NOT NULL,
+    label TEXT,
+    FOREIGN KEY (item_id) REFERENCES items(item_id)
     )
     """)
     conn.commit()
@@ -74,9 +106,22 @@ def view_items():
     conn.close()
     return df
 
+def view_pricing():
+    conn = get_connection()
+    df = pd.read_sql_query('SELECT * FROM pricing_tiers',conn)
+    conn.close()
+    return df
+
 def view_sales():
     conn = get_connection()
     df = pd.read_sql_query('SELECT * FROM sales', conn)
+    conn.close()
+    return df
+
+def view_sales_by_customer (customer_id):
+    conn = get_connection()
+    query = f'SELECT * FROM sales WHERE customer_id = {customer_id}'
+    df = pd.read_sql_query(query, conn)
     conn.close()
     return df
 
@@ -98,8 +143,6 @@ def view_sales_by_customers(customer_id=None):
     
     conn.close()
     return df
-
-
 
 def view_audit_log(start_date=None, end_date=None):
     conn = get_connection()
@@ -127,58 +170,145 @@ def paginate_dataframe(df, page_size=20):
     return df.iloc[start_idx:end_idx], total_pages
 
 # ---------------- CRUD FUNCTIONS ----------------
-def add_or_update_item(item, category, quantity, unit_cost, selling_price, user):
+def add_or_update_item(item_id, item_name, category, quantity, fridge_no, user):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, quantity FROM items WHERE item=? AND category=?', (item, category))
+    if item_id == None:
+        cursor.execute('SELECT item_id, item_name, quantity, fridge_no FROM items WHERE item_name=? AND category=? AND fridge_no=?', (item_name, category, fridge_no))
+    else:
+        cursor.execute('SELECT item_id, item_name, quantity, fridge_no FROM items WHERE item_id=? AND category=? AND fridge_no=?', (item_id, category, fridge_no))
     existing = cursor.fetchone()
     if existing:
-        new_quantity = existing[1] + quantity
-        cursor.execute('UPDATE items SET quantity=?, unit_cost=?, selling_price=? WHERE id=?',
-                       (new_quantity, unit_cost, selling_price, existing[0]))
+        # existing is a tuple (item_id, item_name, quantity)
+        existing_id, existing_name, current_qty, fridge_no = existing
+        new_quantity = current_qty + quantity
+
+        cursor.execute('UPDATE items SET quantity=?, fridge_no=? WHERE item_id=?',
+                       (new_quantity, fridge_no, existing[0]))
         action = "Update"
+        # Log into audit any changes
+        cursor.execute('INSERT INTO audit_log (item_name, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
+                    (existing_name, category, action, quantity, 0.00, 0.00, user))
+
     else:
-        cursor.execute('INSERT INTO items (item, category, quantity, unit_cost, selling_price) VALUES (?, ?, ?, ?, ?)',
-                       (item, category, quantity, unit_cost, selling_price))
+        cursor.execute('INSERT INTO items (item_name, category, quantity, fridge_no) VALUES (?, ?, ?, ?)',
+                       (item_name, category, quantity, fridge_no))
+        new_item_id = cursor.lastrowid   # ✅ get the auto-generated item_id
         action = "Add"
-    cursor.execute('INSERT INTO audit_log (item, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
-                   (item, category, action, quantity, unit_cost, selling_price, user))
+        # Log into audit any changes
+        cursor.execute('INSERT INTO audit_log (item_name, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
+                    (item_name, category, action, quantity, 0.00, 0.00, user))
     conn.commit()
     conn.close()
 
 def delete_item(item_id, user):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT item, category, quantity, unit_cost, selling_price FROM items WHERE id=?', (item_id,))
+    cursor.execute('SELECT item_name, category, quantity FROM items WHERE item_id=?', (item_id,))
     item_details = cursor.fetchone()
     if item_details:
-        cursor.execute('INSERT INTO audit_log (item, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
-                       (item_details[0], item_details[1], "Delete", item_details[2], item_details[3], item_details[4], user))
-        cursor.execute('DELETE FROM items WHERE id=?', (item_id,))
+        cursor.execute('INSERT INTO audit_log (item_name, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
+                       (item_details[0], item_details[1], "Delete", item_details[2], 0.00, 0.00, user))
+        cursor.execute('DELETE FROM items WHERE item_id=?', (item_id,))
     conn.commit()
     conn.close()
 
-def record_sale(item, quantity, user, customer_id):
+# Get total quantity based on item_name
+def get_total_qty(selected_item_name):
     conn = get_connection()
-    item_data = pd.read_sql_query(f"SELECT * FROM items WHERE item='{item}'", conn)
-    if item_data.empty:
+    conn.row_factory = sqlite3.Row   # ensure dict-like access
+    cursor = conn.cursor()
+
+    # Get all records for this item_name (could be multiple fridges)
+    cursor.execute("SELECT * FROM items WHERE item_name=?", (selected_item_name,))
+    rows = cursor.fetchall()
+
+    if not rows:
         conn.close()
         return "Item not found."
-    row = item_data.iloc[0]
-    if row['quantity'] < quantity:
+
+    # ✅ Sum total quantity across all fridges
+    total_quantity = sum(row['quantity'] for row in rows)
+    conn.close()
+    return total_quantity
+
+# Record sales
+def record_sale(item_id, quantity, user, customer_id, override_total=None):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Get item details
+    cursor.execute("SELECT * FROM items WHERE item_id=?", (item_id,))
+    row = cursor.fetchone()
+    if row is None:
+        conn.close()
+        return "Item not found."
+
+    item_name = row['item_name']
+    category = row['category']
+
+    # Get all fridge records for this item_name
+    cursor.execute("SELECT * FROM items WHERE item_name=?", (item_name,))
+    rows = cursor.fetchall()
+    total_quantity = sum(r['quantity'] for r in rows)
+    if total_quantity < quantity:
         conn.close()
         return "Not enough stock."
-    total_sale = quantity * row['selling_price']
-    cost = quantity * row['unit_cost']
-    profit = total_sale - cost
-    conn.execute('UPDATE items SET quantity=? WHERE id=?', (row['quantity'] - quantity, row['id']))
-    conn.execute('INSERT INTO sales (item, quantity, selling_price, total_sale, cost, profit, date, customer_id) VALUES (?, ?, ?, ?, ?, ?, DATE("now"), ?)',
-                 (item, quantity, row['selling_price'], total_sale, cost, profit, customer_id))
-    conn.execute('INSERT INTO audit_log (item, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
-                 (item, row['category'], "Sale", quantity, row['unit_cost'], row['selling_price'], user))
+
+    # Get pricing tier
+    cursor.execute("""
+        SELECT price_per_unit 
+        FROM pricing_tiers
+        WHERE item_id = ?
+          AND min_qty <= ?
+          AND (max_qty IS NULL OR max_qty = 0 OR ? <= max_qty)
+        ORDER BY min_qty DESC
+        LIMIT 1
+    """, (item_id, quantity, quantity))
+    tier = cursor.fetchone()
+    if tier is None:
+        conn.close()
+        return f"No pricing tier found for {quantity} units of item {item_id}."
+
+    price_per_unit = tier['price_per_unit']
+    selling_price = override_total if override_total is not None else price_per_unit
+    total_sale = quantity * selling_price
+    overridden_flag = 1 if override_total is not None else 0
+    cost = 0.0
+    profit = 0.0
+
+    # Deduct stock across fridges
+    qty_to_deduct = quantity
+    deduction_log = []
+    for r in rows:
+        if qty_to_deduct <= 0:
+            break
+        available = r['quantity']
+        deduct = min(available, qty_to_deduct)
+        new_qty = available - deduct
+        cursor.execute("UPDATE items SET quantity=? WHERE item_id=?", (new_qty, r['item_id']))
+        qty_to_deduct -= deduct
+        deduction_log.append(f"Fridge {r['fridge_no']}: deducted {deduct}, new qty={new_qty}")
+
+    # Insert into sales
+    cursor.execute("""
+        INSERT INTO sales 
+        (item_id, item_name, quantity, selling_price, total_sale, cost, profit, date, customer_id, overridden) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, DATE('now'), ?, ?)
+    """, (item_id, item_name, quantity, selling_price, total_sale, cost, profit, customer_id, overridden_flag))
+
+    # Insert into audit log
+    cursor.execute("""
+        INSERT INTO audit_log 
+        (item_name, category, action, quantity, unit_cost, selling_price, user, timestamp) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME('now'))
+    """, (item_name, category, "Sale", quantity, cost, selling_price, user))
+
     conn.commit()
     conn.close()
-    return f"Sale recorded. Profit: ${profit:.2f}"
+
+    return f"Sale recorded. Deduction details:\n" + "\n".join(deduction_log)
 
 # ---------------- Excel/CSV import file for Stock Add/Update ----------------
 def import_items_and_add_or_insert():
@@ -202,11 +332,11 @@ def import_items_and_add_or_insert():
 
     # Process each item in the file
     for _, row in df.iterrows():
-        item_id = row['item_id']
+        item = row['item']
         category = row['category']
-        unit_cost = row['unit_cost']
-        selling_price = row['selling_price']
-        quantity = row['stock_quantity']
+        #unit_cost = row['unit_cost']
+        #selling_price = row['selling_price']
+        quantity = row['quantity']
 
         # Check if item exists
         cursor.execute("SELECT stock_quantity FROM items WHERE item_id = ?", (item_id,))
@@ -220,165 +350,446 @@ def import_items_and_add_or_insert():
         else:
             # Item does not exist, insert new item
             cursor.execute("""
-                INSERT INTO items (item_id, category, unit_cost, selling_price, stock_quantity)
+                INSERT INTO items (item_id, category, quantity)
                 VALUES (?, ?, ?, ?, ?)
-            """, (item_id, category, unit_cost, selling_price, quantity))
+            """, (item_id, category, quantity))
 
     # Commit changes and close connection
     conn.commit()
     conn.close()
     print("Items updated or inserted successfully.")
 
+# ------------ Update Pricing Tiers manually -----
+def update_pricing_tiers_ui():
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Step 1: Select item
+    cursor.execute("SELECT item_id, item_name FROM items")
+    items = cursor.fetchall()
+
+    # Build dictionary with combined display string
+    item_dict = {f"{iid} - {name}": iid for iid, name in items}
+    #item_dict = {name: iid for iid, name in items}
+
+    st.subheader("🔧 Update Pricing Tiers")
+    selected_item = st.selectbox("Select Item", list(item_dict.keys()))
+
+    if selected_item:
+        item_id = item_dict[selected_item]   # retrieve the actual item_id
+        st.write(f"Selected Item ID: {item_id}")
+
+        # Step 2: Show existing tiers
+        cursor.execute("SELECT id, min_qty, max_qty, price_per_unit, label FROM pricing_tiers WHERE item_id=?", (item_id,))
+        tiers = cursor.fetchall()
+
+        if tiers:
+            st.write("Existing Pricing Tiers:")
+            for tier in tiers:
+                tier_id, min_qty, max_qty, price_per_unit, label = tier
+                with st.expander(f"Tier {tier_id} ({label})"):
+                    new_min = st.number_input("Min Qty", value=min_qty, key=f"min_{tier_id}")
+                    new_max = st.number_input("Max Qty (0 = no limit)", value=max_qty if max_qty is not None else 0, key=f"max_{tier_id}")
+                    new_price = st.number_input("Price per Unit", value=price_per_unit, format="%,.2f", key=f"price_{tier_id}")
+                    new_label = st.text_input("Label", value=label, key=f"label_{tier_id}")
+
+                    if st.button(f"Update Tier {tier_id}", key=f"update_{tier_id}"):
+                        cursor.execute("""
+                            UPDATE pricing_tiers
+                            SET min_qty=?, max_qty=?, price_per_unit=?, label=?
+                            WHERE id=?
+                        """, (new_min, None if new_max == 0 else new_max, new_price, new_label, tier_id))
+                        conn.commit()
+                        st.success(f"Tier {tier_id} updated successfully!")
+
+        else:
+            st.info("No pricing tiers found for this item.")
+
+    conn.close()
+
+# ----------------- Manage Pricing Tiers -------------
+def manage_pricing_tiers():
+    st.title("Manage Pricing Tiers")
+
+    # Select item first
+    items_df = view_items()
+    if items_df.empty:
+        st.warning("No items found.")
+        return
+
+    item_label = st.selectbox(
+        "Select Item",
+        items_df.apply(lambda row: f"{row['item_id']} - {row['item_name']}", axis=1)
+    )
+    item_id = int(item_label.split(" - ")[0])
+
+    # Show existing tiers
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM pricing_tiers WHERE item_id=? ORDER BY min_qty", (item_id,))
+    tiers = cursor.fetchall()
+    conn.close()
+
+    if tiers:
+        st.subheader("Existing Pricing Tiers")
+        tiers_df = pd.DataFrame(tiers, columns=tiers[0].keys())
+        # Format nicely
+        tiers_df["max_qty"] = tiers_df["max_qty"].fillna("∞")
+        tiers_df["price_per_unit"] = tiers_df["price_per_unit"].map(lambda x: f"{x:.2f}")
+        st.dataframe(tiers_df, width='stretch')
+    else:
+        st.info("No pricing tiers defined for this item yet.")
+
+    st.markdown("---")
+
+    # ✅ Collapsible Add/Update section
+    with st.expander("➕ Add / Update Pricing Tier", expanded=False):
+        min_qty = st.number_input("Minimum Quantity", min_value=1)
+        max_qty = st.number_input("Maximum Quantity (0 = unlimited)", min_value=0)
+        price_per_unit = st.number_input("Price per Unit", min_value=0.0, format="%.2f")
+        label = st.text_input("Tier Label (optional)", value="")
+
+        if st.button("Save Tier"):
+            conn = get_connection()
+            cursor = conn.cursor()
+            if validate_if_exist(item_id, min_qty, max_qty):   # if existing, means it's an update
+                cursor.execute(
+                    "UPDATE pricing_tiers set price_per_unit=?, label=? where item_id=? and min_qty=? and max_qty=?",
+                    (price_per_unit, label, item_id, min_qty, max_qty)
+                ) 
+                conn.commit()
+                conn.close()
+                st.success(f"Updated existing pricing tier for {item_id}.")
+                st.rerun()
+            else:
+                cursor.execute(
+                    "INSERT INTO pricing_tiers (item_id, min_qty, max_qty, price_per_unit, label) VALUES (?, ?, ?, ?, ?)",
+                    (item_id, min_qty, None if max_qty == 0 else max_qty, price_per_unit, label)
+                )                
+                conn.commit()
+                conn.close()
+                st.success("Added new Pricing tier successfully!")
+                st.rerun()
+
+
+    # ✅ Collapsible Delete section
+    if tiers:
+        with st.expander("🗑️ Delete a Tier", expanded=False):
+            st.subheader("Delete a Tier")
+            tier_to_delete = "Select Tier to Delete" 
+            # tier_ids = [f"{t['id']} (min {t['min_qty']}, max {t['max_qty'] or '∞'})" for t in tiers]
+            tier_ids = ["Select Tier to Delete"] + [
+                f"{t['id']} (min {t['min_qty']}, max {t['max_qty'] or '∞'})" for t in tiers
+            ]
+            tier_to_delete = st.selectbox("Select Tier to Delete", tier_ids)
+            if st.button("Delete Tier"):
+                tier_id = int(tier_to_delete.split()[0])
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM pricing_tiers WHERE id=?", (tier_id,))
+                conn.commit()
+                conn.close()
+                st.success("Tier deleted successfully!")
+                st.rerun()
+
+# -------------- Validate no overlap on tiers -----------------
+def validate_if_exist(item_id, min_qty, max_qty):
+    """
+    Returns True if the proposed [min_qty, max_qty] does NOT overlap
+    with any existing tier for the item. Treats None as infinity.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, min_qty, max_qty FROM pricing_tiers WHERE item_id=? and min_qty=? and max_qty=?", (item_id, min_qty, max_qty))
+    rows = cur.fetchall()
+    if rows:
+        conn.close()
+        return True
+    else:
+        conn.close()
+        return False
+
+# --------------- Validate if customer exists --------------
+def validate_if_customer_exist(name):
+    """
+    Docstring for validate_if_customer_exist
+    
+    :param name: Description
+    """
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM CUSTOMERS WHERE name=?", (name.upper(),))
+    rows = cur.fetchall()
+    if rows:
+        conn.close()
+        return True
+    else:
+        conn.close()
+        return False
+
+# --------------- Generate Purchase Order ----------------
+def generate_po_pdf(order_date, customer_id, pickup_date):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # --- Generate PO Number ---
+    cursor.execute("CREATE TABLE IF NOT EXISTS po_sequence (date TEXT, seq INTEGER)")
+    cursor.execute("SELECT seq FROM po_sequence WHERE date=?", (order_date,))
+    row = cursor.fetchone()
+    if row:
+        seq = row['seq'] + 1
+        cursor.execute("UPDATE po_sequence SET seq=? WHERE date=?", (seq, order_date))
+    else:
+        seq = 1
+        cursor.execute("INSERT INTO po_sequence (date, seq) VALUES (?, ?)", (order_date, seq))
+    conn.commit()
+    po_number = f"PO-{order_date.replace('-', '')}-{seq:03d}"
+
+    # --- Vendor Info ---
+    vendor = {
+        "name": "KPrime Supplies",
+        "address": "Blk 3 Lot 5 West Wing Villas, North Belton QC",
+        "phone": "+63 995 744 9953",
+        "email": "kprimefoodinc@gmail.com"
+    }
+
+    # --- Buyer Info ---
+    cursor.execute("SELECT * FROM customers WHERE id=?", (customer_id,))
+    customer = cursor.fetchone()
+    buyer = {
+        "name": customer['name'],
+        "address": customer['address'],
+        "phone": customer['phone'],
+        "email": customer['email']
+    }
+    safe_name = buyer['name'].replace(" ", "_").replace("/", "_")
+    filename = f"PO_{order_date.replace('-', '')}_{safe_name}.pdf"
+
+    # --- Order Details ---
+    sales_df = pd.read_sql_query(
+        "SELECT item_id, item_name, SUM(quantity) as total_qty, selling_price "
+        "FROM sales WHERE date=? AND customer_id=? GROUP BY item_name, selling_price",
+        conn,
+        params=(order_date, customer_id)
+    )
+    conn.close()
+
+    # --- Build PDF ---
+    doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=40)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # Header
+    elements.append(Paragraph("PURCHASE ORDER (PO)", styles['Title']))
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph(f"PO Number: {po_number}", styles['Normal']))
+    elements.append(Paragraph(f"Date: {datetime.strptime(order_date, '%Y-%m-%d').strftime('%d %b %Y')}", styles['Normal']))
+    elements.append(Spacer(1, 12))
+
+    # Vendor
+    elements.append(Paragraph("<b>Vendor/Supplier:</b>", styles['Heading2']))
+    elements.append(Paragraph(f"{vendor['name']}", styles['Normal']))
+    elements.append(Paragraph(f"{vendor['address']}", styles['Normal']))
+    elements.append(Paragraph(f"Tel: {vendor['phone']}", styles['Normal']))
+    elements.append(Paragraph(f"Email: {vendor['email']}", styles['Normal']))
+    elements.append(Spacer(1, 12))
+
+    # Buyer
+    elements.append(Paragraph("<b>Buyer:</b>", styles['Heading2']))
+    elements.append(Paragraph(f"{buyer['name']}", styles['Normal']))
+    elements.append(Paragraph(f"{buyer['address']}", styles['Normal']))
+    elements.append(Paragraph(f"Tel: {buyer['phone']}", styles['Normal']))
+    elements.append(Paragraph(f"Email: {buyer['email']}", styles['Normal']))
+    elements.append(Spacer(1, 12))
+
+    # Order Details Table
+    data = [["Item No.", "Description", "Quantity", "Unit Price (PHP)", "Total (PHP)"]]
+    subtotal = 0
+    for idx, row in sales_df.iterrows():
+        total = row['total_qty'] * row['selling_price']
+        subtotal += total
+        data.append([
+            idx+1,
+            row['item_name'],
+            row['total_qty'],
+            f"{row['selling_price']:,.2f}",
+            f"{total:,.2f}"
+        ])
+
+    table = Table(data, colWidths=[50, 200, 60, 100, 100], hAlign='LEFT')
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+        ('ALIGN',(2,1),(2,-1),'RIGHT'),   # Quantity column right aligned
+        ('ALIGN',(3,1),(4,-1),'RIGHT'),   # Unit Price and Total right aligned
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold')
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 12))
+
+    # Totals
+    elements.append(Paragraph(f"Subtotal: PHP {subtotal:,.2f}", styles['Normal']))
+    elements.append(Paragraph("GST: PHP 0.00 (No GST)", styles['Normal']))
+    elements.append(Paragraph(f"Total Amount: PHP {subtotal:,.2f}", styles['Normal']))
+    elements.append(Spacer(1, 12))
+
+    # Pickup Date
+    elements.append(Paragraph(f"Pickup Date: {pickup_date}", styles['Normal']))
+    elements.append(Spacer(1, 32))
+    elements.append(Paragraph("Authorized By:", styles['Normal']))
+    elements.append(Paragraph("(Signature & Name)", styles['Normal']))
+
+    # Build PDF
+    doc.build(elements)
+    return filename
+
 
 # ---------------- PDF Generation for SOA ----------------
 
 # Blk 3 Lot 5 West Wing Villas, North Belton QC
 # -*- coding: utf-8 -*-
-import fitz
-import os
 
-def generate_soa_pdf(customer_name, customer_id, start_date, end_date, soa_df, logo_path="KPrime.jpg"):
-    pdf_filename = f"statement_customer_{customer_id}_{customer_name}.pdf"
-    doc = fitz.open()
+def generate_soa_pdf(customer_name, customer_id, start_date, end_date, soa_df):
 
-    # Path to Unicode font (download DejaVuSans.ttf and place in same folder)
-    font_path = "DejaVuSans.ttf"  # Ensure this file exists in your working directory
+    # Ensure start_date and end_date are strings
+    if not isinstance(start_date, str):
+        start_date = start_date.strftime("%Y-%m-%d")
+    if not isinstance(end_date, str):
+        end_date = end_date.strftime("%Y-%m-%d")
 
-    # Page settings
-    page_width, page_height = 595, 842  # A4 size
-    margin_left = 50
-    row_height = 20
-    col_positions = [50, 150, 250, 350, 450]  # Date, Item, Qty, Price, Total
-    headers = ["Date", "Item", "Qty", "Price", "Total"]
-    char_width = 6  # Approx width for alignment calculation
+    # --- File name ---
+    safe_name = customer_name.replace(" ", "_").replace("/", "_")
+    filename = f"SOA_{start_date.replace('-', '')}_{end_date.replace('-', '')}_{safe_name}.pdf"
 
-    def draw_header(page):
-        # Logo
-        if logo_path and os.path.exists(logo_path):
-            rect = fitz.Rect(50, 20, 150, 80)
-            page.insert_image(rect, filename=logo_path)
+    # --- Build PDF ---
+    doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=40)
+    styles = getSampleStyleSheet()
+    elements = []
 
-        # Company details
-        page.insert_text((200, 40), "KPrime Food Solutions", fontsize=14, fontfile=font_path)
-        page.insert_text((200, 60), "Blk 3 Lot 5 West Wing Villas, North Belton QC | +63-800-555-1234", fontsize=10, fontfile=font_path)
+    # Header
+    elements.append(Paragraph("STATEMENT OF ACCOUNT (SOA)", styles['Title']))
+    elements.append(Paragraph(f"Customer: {customer_name} (ID: {customer_id})", styles['Normal']))
+    elements.append(Paragraph(f"Period: {start_date} to {end_date}", styles['Normal']))
+    elements.append(Spacer(1, 12))
 
-        # SOA Title
-        page.insert_text((margin_left, 100), "Statement of Account", fontsize=16, fontfile=font_path)
-        page.insert_text((margin_left, 120), f"Customer: {customer_name} (ID: {customer_id})", fontsize=12, fontfile=font_path)
-        page.insert_text((margin_left, 135), f"Period: {start_date} to {end_date}", fontsize=12, fontfile=font_path)
+    # Table Header
+    data = [["Date", "Item", "Quantity", "Unit Price (PHP)", "Total (PHP)"]]
 
-    def draw_table_header(page, y):
-        # Left-aligned headers
-        page.insert_text((col_positions[0], y), headers[0], fontsize=12, fontfile=font_path)
-        page.insert_text((col_positions[1], y), headers[1], fontsize=12, fontfile=font_path)
-        page.insert_text((col_positions[2], y), headers[2], fontsize=12, fontfile=font_path)
-
-        # Right-align Price & Total headers
-        price_header = headers[3]
-        total_header = headers[4]
-        price_x = col_positions[3] + 80 - (len(price_header) * char_width)
-        total_x = col_positions[4] + 80 - (len(total_header) * char_width)
-        page.insert_text((price_x, y), price_header, fontsize=12, fontfile=font_path)
-        page.insert_text((total_x, y), total_header, fontsize=12, fontfile=font_path)
-
-        # Horizontal line under header
-        page.draw_line((col_positions[0], y + 15), (col_positions[-1] + 80, y + 15))
-        return y + row_height + 5
-
-    # Create first page
-    page = doc.new_page(width=page_width, height=page_height)
-    draw_header(page)
-    y = draw_table_header(page, 160)
-
-    # Table rows
+    # Table Rows
+    total_amount = 0
+    total_qty = 0
     for idx, row in soa_df.iterrows():
-        # New page if needed
-        if y + row_height > page_height - 100:
-            page = doc.new_page(width=page_width, height=page_height)
-            draw_header(page)
-            y = draw_table_header(page, 160)
+        qty = row['quantity']
+        price = row['selling_price']
+        total = row['total_sale']
+        total_amount += total
+        total_qty += qty
 
-        # Insert row text
-        page.insert_text((col_positions[0], y), str(row['date']), fontsize=10, fontfile=font_path)
-        page.insert_text((col_positions[1], y), str(row['item']), fontsize=10, fontfile=font_path)
-        page.insert_text((col_positions[2], y), str(row['quantity']), fontsize=10, fontfile=font_path)
+        data.append([
+            str(row['date']),
+            str(row['item_name']),
+            qty,
+            f"{price:,.2f}",
+            f"{total:,.2f}"
+        ])
 
-        # Right-align Price and Total with Peso symbol
-        price_text = f"PHP{row['selling_price']:,.2f}"
-        total_text = f"PHP{row['total_sale']:,.2f}"
-        price_x = col_positions[3] + 80 - (len(price_text) * char_width)
-        total_x = col_positions[4] + 80 - (len(total_text) * char_width)
+    # Create Table
+    table = Table(data, colWidths=[80, 180, 50, 90, 90], hAlign='LEFT')
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+        ('ALIGN',(2,1),(2,-1),'RIGHT'),   # Quantity column right aligned
+        ('ALIGN',(3,1),(4,-1),'RIGHT'),   # Unit Price and Total right aligned
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold')
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 12))
 
-        page.insert_text((price_x, y), price_text, fontsize=10, fontfile=font_path)
-        page.insert_text((total_x, y), total_text, fontsize=10, fontfile=font_path)
-
-        y += row_height
-
-    # Summary row
-    y += 20
-    total_amount = soa_df['total_sale'].sum()
-    total_qty = soa_df['quantity'].sum()
+    # Summary
     transaction_count = len(soa_df)
-
-    summary_text = f"Transactions: {transaction_count} | Total Qty: {total_qty}"
-    page.insert_text((col_positions[0], y), summary_text, fontsize=11, fontfile=font_path)
-
-    # Total Amount (right-aligned)
-    y += 20
-    total_text = f"Total: PHP{total_amount:,.2f}"
-    total_x = col_positions[4] + 80 - (len(total_text) * char_width)
-    page.insert_text((total_x, y), total_text, fontsize=12, fontfile=font_path)
+    elements.append(Paragraph(f"Transactions: {transaction_count}", styles['Normal']))
+    elements.append(Paragraph(f"Total Quantity: {total_qty}", styles['Normal']))
+    elements.append(Paragraph(f"Total Amount: PHP {total_amount:,.2f}", styles['Normal']))
+    elements.append(Spacer(1, 24))
 
     # Footer
-    page.insert_text((margin_left, page_height - 50), "Thank you for choosing Steak Haven - Premium Quality Meat",
-                     fontsize=10, color=(0.5, 0.5, 0.5), fontfile=font_path)
+    elements.append(Paragraph("Thank you for choosing Steak Haven - Premium Quality Meat", styles['Normal']))
 
-    doc.save(pdf_filename)
-    doc.close()
-    return pdf_filename
+    # Build PDF
+    doc.build(elements)
+    return filename
 
 # --- Add Price History Table Creation ---
-def create_price_history_table():
+def create_price_history_table2():
     conn = get_connection()
     conn.execute("CREATE TABLE IF NOT EXISTS price_history (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER, old_quantity INTEGER, new_price_quantity INTEGER, old_unit_cost REAL, old_selling_price REAL, new_unit_cost REAL, new_selling_price REAL, changed_by TEXT, timestamp TEXT)")
     conn.commit()
     conn.close()
 
-# --- Updated add_or_update_item() ---
-def add_or_update_item(item, category, quantity, unit_cost, selling_price, user):
+# ---------------- Upload Tiered Pricing ----------------
+def upload_tiered_pricing(uploaded_file):
+    if uploaded_file is None:
+        st.error("No file uploaded.")
+        return
+
+    # Determine file type and read accordingly
+    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+    if file_ext == '.csv':
+        df = pd.read_csv(uploaded_file)
+    elif file_ext == '.xlsx':
+        df = pd.read_excel(uploaded_file, engine='openpyxl')
+    elif file_ext == '.xls':
+        df = pd.read_excel(uploaded_file, engine='xlrd')
+    else:
+        raise ValueError("Unsupported file format. Please upload a CSV or Excel file.")
+
+    # Connect to the database
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, quantity, unit_cost, selling_price FROM items WHERE item=? AND category=?', (item, category))
-    existing = cursor.fetchone()
 
-    if existing:
-        item_id, current_qty, old_unit_cost, old_selling_price = existing
-        new_quantity = current_qty + quantity
+    # Process each pricing tier in the file
+    for _, row in df.iterrows():
+        item_id = row['item_id']
+        min_qty = row['min_qty']
+        max_qty = row['max_qty'] if not pd.isna(row['max_qty']) else None
+        price_per_unit = row['price_per_unit']
+        label = row['label']
 
-        # Log price changes
-        # old_quantity INTEGER, new_price_quantity
-        if old_unit_cost != unit_cost or old_selling_price != selling_price:
-            cursor.execute('INSERT INTO price_history (item_id, old_quantity, new_price_quantity, old_unit_cost, old_selling_price, new_unit_cost, new_selling_price, changed_by, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
-                           (item_id, current_qty, quantity, old_unit_cost, old_selling_price, unit_cost, selling_price, user))
+        # Check if record exists
+        cursor.execute("""
+            SELECT id FROM pricing_tiers
+            WHERE item_id = ? AND min_qty = ? AND (max_qty IS ? OR max_qty = ?) AND label = ?
+        """, (item_id, min_qty, max_qty, max_qty, label))
+        existing = cursor.fetchone()
 
-        cursor.execute('UPDATE items SET quantity=?, unit_cost=?, selling_price=? WHERE id=?',
-                       (new_quantity, unit_cost, selling_price, item_id))
-        action = "Update"
-    else:
-        cursor.execute('INSERT INTO items (item, category, quantity, unit_cost, selling_price) VALUES (?, ?, ?, ?, ?)',
-                       (item, category, quantity, unit_cost, selling_price))
-        action = "Add"
+        if existing:
+            # Update price_per_unit if record exists
+            cursor.execute("""
+                UPDATE pricing_tiers
+                SET price_per_unit = ?
+                WHERE id = ?
+            """, (price_per_unit, existing[0]))
+        else:
+            # Insert new record if not found
+            cursor.execute("""
+                INSERT INTO pricing_tiers (item_id, min_qty, max_qty, price_per_unit, label)
+                VALUES (?, ?, ?, ?, ?)
+            """, (item_id, min_qty, max_qty, price_per_unit, label))
 
-    # Audit log
-    cursor.execute('INSERT INTO audit_log (item, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
-                   (item, category, action, quantity, unit_cost, selling_price, user))
-
+    # Commit changes and close connection
     conn.commit()
     conn.close()
+    st.success("Pricing Tiers updated or inserted successfully!")
 
 # ---------------- CREATE TABLES ----------------
 create_tables()
-create_price_history_table()
+#create_price_history_table()
 
 # ---------------- LOGOUT FUNCTION ----------------
 def logout():
@@ -388,16 +799,14 @@ def logout():
 
 # ---------------- LOGIN PAGE ----------------
 if not st.session_state.logged_in:
-    if os.path.exists("KPrime.jpg"):
-        st.image("KPrime.jpg", width=250)
-    else:
-        st.write("Logo not available")
-    st.title("Welcome to KPrime Food Solutions")
+    if os.path.exists("kprime.jpg"):
+        st.image("Kprime.jpg", width=250)
+    st.title("Welcome to Steak Haven Inventory")
     st.write("Your choice for premium quality meat")
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
     if st.button("Login"):
-        if (username == "admin" or username == "Admin") and password == "1234":
+        if username == "admin" and password == "1234":
             st.session_state.logged_in = True
             st.session_state.menu = "Home"
             st.session_state.username = username
@@ -416,15 +825,52 @@ elif st.session_state.logged_in:
     st.sidebar.button("Logout", on_click=logout)
     st.sidebar.header("Settings")
     stock_threshold = st.sidebar.number_input("Set Stock Alert Threshold", min_value=0, value=5)
-    menu = st.sidebar.selectbox(
-        "Select Option",
-        ["Home", "Add/Update Stock", "File Upload (Stocks)", "View Inventory", "Delete Item", "Add Customer", "View Customers", "Record Sale", "Profit/Loss Report", "View Audit Log", "Customer Statement of Account", "View Price History", "Price Change Impact Report"],
-        index=["Home", "Add/Update Stock", "File Upload (Stocks)", "View Inventory", "Delete Item", "Add Customer", "View Customers", "Record Sale", "Profit/Loss Report", "View Audit Log", "Customer Statement of Account", "View Price History", "Price Change Impact Report"].index(st.session_state.menu)
-    )
-    st.session_state.menu = menu
 
-    #if os.path.exists("KPRime.jpg"):
-    #    st.image("KPrime.jpg", width=150)
+    with st.sidebar:
+        # Main menu
+        main_menu = option_menu(
+            "Main Menu",
+            ["Home", "Inventory", "Pricing", "Customer", "Reports"],
+            icons=["house", "box", "list", "people", "bar-chart"],
+            menu_icon="cast",
+            default_index=0
+        )
+
+        # Submenu depending on main menu
+        if main_menu == "Home":
+            menu = option_menu("Home", ["Home"], icons=["house"])
+        elif main_menu == "Inventory":
+            menu = option_menu("Inventory", [
+                "View Inventory",
+                "Manage Stock",
+                "File Upload (Items)",
+                "Delete All Inventory"
+            ], icons=["plus-circle", "list", "pencil", "upload", "trash"])
+        elif main_menu == "Pricing":
+            menu = option_menu("Pricing", [
+                "View Pricing Tiers",
+                "File Upload (Pricing)",
+                "Manage Pricing Tiers"
+            ], icons=["list", "upload", "pencil"])
+        elif main_menu == "Customer":
+            menu = option_menu("Customer", [
+                "Manage Customers",
+                "View Sale for a Customer",
+                "Add Customer",
+                "Record Sale",
+                "Customer Statement of Account",
+                "Delete All Customers"
+            ], icons=["person-plus", "people", "gear", "clipboard", "file-text", "trash"])
+        elif main_menu == "Reports":
+            menu = option_menu("Reports", [
+                "Profit/Loss Report",
+                "View Audit Log",
+                "Generate Purchase Order",
+                "Price Change Impact Report"
+            ], icons=["graph-up", "book", "file-earmark-text", "bar-chart"])
+
+    st.session_state.menu = menu
+    st.write(f"Selected: {main_menu} → {menu}")
 
 ## Aileen Added
 
@@ -436,91 +882,192 @@ elif st.session_state.logged_in:
         if not items_df.empty:
             st.subheader("Inventory Summary")
             st.metric("Total Items", len(items_df))
-            st.metric("Total Stock Value", f"${(items_df['quantity'] * items_df['unit_cost']).sum():,.2f}")
+            #st.metric("Total Stock Value", f"${(items_df['quantity'] * items_df['unit_cost']).sum():,.2f}")
             fig = px.bar(items_df, x='category', y='quantity', color='category', title="Stock by Category")
             st.plotly_chart(fig)
         if not sales_df.empty:
             st.subheader("Sales Summary")
-            st.metric("Total Sales", f"${sales_df['total_sale'].sum():,.2f}")
-            st.metric("Total Profit", f"${sales_df['profit'].sum():,.2f}")
+            #st.metric("Total Sales", f"${sales_df['total_sale'].sum():,.2f}")
+            #st.metric("Total Profit", f"${sales_df['profit'].sum():,.2f}")
             fig2 = px.line(sales_df, x='date', y='profit', title="Profit Trend Over Time")
             st.plotly_chart(fig2)
 
     # ---------------- ADD/UPDATE STOCK ----------------
+    elif menu == "Manage Stock":
+        st.title("Manage Stock")
+
+        items_df = view_items()
+        if items_df.empty:
+            st.warning("No items found.")
+        else:
+            # Show current inventory list
+            st.subheader("Current Inventory")
+            st.dataframe(items_df[['item_id','item_name','category','quantity','fridge_no']])
+
+        # --- Collapsible section: Add/Update Stock ---
+        with st.expander("➕ Add or Update Stock", expanded=False):
+            existing_categories = sorted(items_df['category'].dropna().unique()) if not items_df.empty else []
+            category_options = ["Add New"] + existing_categories
+
+            # Build item options with "<item_id> - <item_name>"
+            if not items_df.empty:
+                item_options = ["Add New"] + [f"{row['item_id']} - {row['item_name']}" for _, row in items_df.iterrows()]
+            else:
+                item_options = ["Add New"]
+
+            selected_item = st.selectbox("Select Item", item_options)
+
+            current_stock = None
+            if selected_item != "Add New":
+                selected_item_id = int(selected_item.split(" - ")[0])
+                selected_item_name = selected_item.split(" - ")[1]
+
+                item_rows = items_df[items_df['item_name'] == selected_item_name]
+                if not item_rows.empty:
+                    st.session_state.selected_category = item_rows.iloc[0]['category']
+                    category_name = st.session_state.selected_category
+
+                    current_stock = item_rows['quantity'].sum()
+                    st.info(f"Stock Currently On Hand: {current_stock}")
+
+                    st.write("Per-Fridge Breakdown:")
+                    st.dataframe(item_rows[['fridge_no','quantity']])
+                else:
+                    st.warning(f"No records found for item '{selected_item}'.")
+                    current_stock = None
+            else:
+                selected_category = st.selectbox("Select Category", category_options)
+                category_name = selected_category
+                if selected_item == "Add New" and selected_category == "Add New":
+                    category_name = st.text_input("Enter New Category Name")
+
+            item_name = (
+                st.text_input("Enter New Item Name", value=st.session_state.item_name)
+                if selected_item == "Add New"
+                else selected_item.split(" - ")[1]
+            )
+            item_id = selected_item.split(" - ")[0]
+            quantity = st.number_input("Quantity to Add", min_value=1, value=st.session_state.quantity)
+            fridge_no = st.text_input("Fridge No", value=st.session_state.fridge_no)
+
+            if st.button("Save"):
+                if item_id and category_name:
+                    add_or_update_item(item_id, item_name.strip().upper(), category_name.strip().upper(), quantity, fridge_no, st.session_state.username)
+                    st.success(f"Item '{item_name}' in category '{category_name}' updated successfully!")
+                    st.rerun()
+                else:
+                    st.error("Please provide valid item and category names.")
+
+        # --- Collapsible section: Delete Item ---
+        with st.expander("🗑️ Delete Item", expanded=False):
+            if items_df.empty:
+                st.warning("No items to delete.")
+            else:
+                selected_label = "Select Item to Delete"
+                items_df['label'] = items_df.apply(lambda row: f"{row['item_id']} - {row['category']} - {row['item_name']}", axis=1)
+                selected_label = st.selectbox("Select Item to Delete", items_df['label'])
+                item_id = int(selected_label.split(" - ")[0])
+                if st.button("Delete"):
+                    delete_item(item_id, st.session_state.username)
+                    st.success(f"Item with ID {item_id} deleted successfully!")
+                    st.rerun()
+
+
+
     elif menu == "Add/Update Stock":
         st.title("Add or Update Stock")
         items_df = view_items()
-        existing_items = sorted(items_df['item'].dropna().unique()) if not items_df.empty else []
         existing_categories = sorted(items_df['category'].dropna().unique()) if not items_df.empty else []
-        item_options = ["Add New"] + existing_items
+
+        # Build item options with "<item_id> - <item_name>"
+        if not items_df.empty:
+            item_options = ["Add New"] + [
+                f"{row['item_id']} - {row['item_name']}" for _, row in items_df.iterrows()
+            ]
+        else:
+            item_options = ["Add New"]
+
         category_options = ["Add New"] + existing_categories
 
         # Session state initialization
         if 'item_name' not in st.session_state: st.session_state.item_name = ""
         if 'category_name' not in st.session_state: st.session_state.category_name = ""
         if 'quantity' not in st.session_state: st.session_state.quantity = 1
-        if 'unit_cost' not in st.session_state: st.session_state.unit_cost = 0.0
-        if 'selling_price' not in st.session_state: st.session_state.selling_price = 0.0
+        if 'fridge_no' not in st.session_state: st.session_state.fridge_no = ""
         if 'selected_item' not in st.session_state: st.session_state.selected_item = "Add New"
         if 'selected_category' not in st.session_state: st.session_state.selected_category = "Add New"
         if 'show_next_action' not in st.session_state: st.session_state.show_next_action = False
 
-        selected_item = st.selectbox("Select Item", item_options, index=item_options.index(st.session_state.selected_item) if st.session_state.selected_item in item_options else 0)
+        selected_item = st.selectbox(
+            "Select Item",
+            item_options,
+            index=item_options.index(st.session_state.selected_item) if st.session_state.selected_item in item_options else 0
+        )
 
         current_stock = None
         if selected_item != "Add New":
-            item_details = items_df[items_df['item'] == selected_item].iloc[0]
-            st.session_state.unit_cost = item_details['unit_cost']
-            st.session_state.selling_price = item_details['selling_price']
-            st.session_state.selected_category = item_details['category']
-            st.markdown(f"<div style='background-color:#003366;color:white;padding:8px;border-radius:4px;'>Category: {st.session_state.selected_category}</div>", unsafe_allow_html=True)
-            category_name = st.session_state.selected_category
-            current_stock = item_details['quantity']
+            # Extract item_id back from "<item_id> - <item_name>"
+            selected_item_id = int(selected_item.split(" - ")[0])
+            selected_item_name = selected_item.split(" - ")[1]
+
+            # Get all rows for this item_id (could be multiple fridges)
+            item_rows = items_df[items_df['item_name'] == selected_item_name]
+
+            if not item_rows.empty:
+                # Category is the same across rows
+                st.session_state.selected_category = item_rows.iloc[0]['category']
+                st.markdown(
+                    f"<div style='background-color:#003366;color:white;padding:8px;border-radius:4px;'>Category: {st.session_state.selected_category}</div>",
+                    unsafe_allow_html=True
+                )
+                category_name = st.session_state.selected_category
+
+                num_records = len(item_rows)
+                st.write(f"Number of records in item_rows: {num_records}")
+
+                # ✅ Sum all quantities across fridge_no
+                current_stock = item_rows['quantity'].sum()
+
+                # Optional: show per-fridge breakdown
+                st.write("Per-Fridge Breakdown:")
+                st.dataframe(item_rows[['fridge_no', 'quantity']])
+            else:
+                st.warning(f"No records found for item '{selected_item}'.")
+                current_stock = None
 
         if current_stock is not None:
             st.info(f"Stock Currently On Hand: {current_stock}")
         else:
-            selected_category = st.selectbox("Select Category", category_options, index=category_options.index(st.session_state.selected_category) if st.session_state.selected_category in category_options else 0)
+            selected_category = st.selectbox(
+                "Select Category",
+                category_options,
+                index=category_options.index(st.session_state.selected_category) if st.session_state.selected_category in category_options else 0
+            )
             category_name = selected_category
             if selected_item == "Add New" and selected_category == "Add New":
                 category_name = st.text_input("Enter New Category Name")
-
-        item_name = st.text_input("Enter New Item Name", value=st.session_state.item_name) if selected_item == "Add New" else selected_item
+        
+        item_name = (
+            st.text_input("Enter New Item Name", value=st.session_state.item_name)
+            if selected_item == "Add New"
+            else selected_item.split(" - ")[1]  # extract item_name part
+        )
+        item_id = selected_item.split(" - ")[0]  # extract item_id part
         quantity = st.number_input("Quantity to Add", min_value=1, value=st.session_state.quantity)
-        unit_cost = st.number_input("Unit Cost", min_value=0.0, format="%.2f", value=st.session_state.unit_cost)
-        selling_price = st.number_input("Selling Price", min_value=0.0, format="%.2f", value=st.session_state.selling_price)
+        fridge_no = st.text_input("Fridge No", value=st.session_state.fridge_no)
 
         if st.button("Save"):
-            if item_name and category_name:
-                add_or_update_item(item_name, category_name, quantity, unit_cost, selling_price, st.session_state.username)
+            if item_id and category_name:
+                #st.write(f"calling function - {item_id} and {quantity}")
+                add_or_update_item(item_id, item_name.strip().upper(), category_name.strip().upper(), quantity, fridge_no, st.session_state.username)
                 st.success(f"Item '{item_name}' in category '{category_name}' updated successfully!")
                 st.session_state.show_next_action = True
             else:
                 st.error("Please provide valid item and category names.")
 
-        if st.session_state.show_next_action:
-            st.markdown("---")
-            st.subheader("Next Action")
-            next_action = st.radio("What would you like to do next?", ["Add/Update More Stock", "View Inventory"])
-            if st.button("Continue"):
-                if next_action == "Add/Update More Stock":
-                    st.session_state.item_name = ""
-                    st.session_state.category_name = ""
-                    st.session_state.quantity = 1
-                    st.session_state.unit_cost = 0.0
-                    st.session_state.selling_price = 0.0
-                    st.session_state.selected_item = "Add New"
-                    st.session_state.selected_category = "Add New"
-                    st.session_state.show_next_action = False
-                    st.rerun()
-                elif next_action == "View Inventory":
-                    st.session_state.show_next_action = False
-                    st.session_state.menu = "View Inventory"
-                    st.rerun()
-
-    # ---------------- File Upload (Stocks) ----------------
-    elif menu == "File Upload (Stocks)":
-        st.title("File Upload (Stocks)")
+    # ---------------- File Upload (Items) ----------------
+    elif menu == "File Upload (Items)":
+        st.title("File Upload (Items)")
         uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"])
         if uploaded_file is not None:
             # Read file based on extension
@@ -531,18 +1078,52 @@ elif st.session_state.logged_in:
                 df = pd.read_excel(uploaded_file)
             
             # Validate columns
-            required_cols = ["item", "category", "quantity", "unit_cost", "selling_price"]
+            required_cols = ["item_name", "category", "quantity", "fridge_no"]
             if all(col in df.columns for col in required_cols):
                 conn = get_connection()
                 cursor = conn.cursor()
                 for _, row in df.iterrows():
-                    add_or_update_item(row["item"], row["category"], row["quantity"], row["unit_cost"], row["selling_price"], st.session_state.username)
+                    add_or_update_item(None, row["item_name"].strip().upper(), row["category"].strip().upper(), row["quantity"], row["fridge_no"], st.session_state.username)
                 conn.commit()
                 conn.close()
                 st.success("Items updated or inserted successfully!")
             else:
                 st.error(f"Missing required columns: {required_cols}")
 
+    # ---------------- UPLOAD PRICING ----------------
+    elif menu == "File Upload (Pricing)":
+        st.title("File Upload (Pricing)")
+        uploaded_file = st.file_uploader("Upload Pricing CSV or Excel file", type=["csv", "xlsx", "xls"])
+        if uploaded_file:
+            upload_tiered_pricing(uploaded_file)
+            
+    # ---------------- View Tiered Pricing ------------------
+    elif menu == "View Pricing Tiers":
+        st.title("View Pricing Tiers")
+        # show the tiered pricing
+        data = view_pricing()
+        if data.empty:
+            st.warning("No pricing found.")
+        else:
+            paged_df, total_pages = paginate_dataframe(data, page_size=100)
+            st.write(f"Showing {len(paged_df)} rows (Page size: 100)")
+
+
+            st.dataframe(
+                paged_df.style
+                .format({"price_per_unit": "{:,.2f}"}),
+                width="stretch"
+                )
+            csv_inventory = data.to_csv(index=False)
+            st.download_button("Download Pricing Tiers CSV", data=csv_inventory, file_name="Pricing tiers.csv", mime="text/csv")               
+
+    # ---------------- Update Pricing Manually ---------
+    elif menu == "Update Pricing Manually":
+        update_pricing_tiers_ui()
+        
+    # ---------------- Manage Pricing Tiers -----------
+    elif menu == "Manage Pricing Tiers":
+        manage_pricing_tiers()
     # ---------------- VIEW INVENTORY ----------------
     elif menu == "View Inventory":
         st.title("Inventory Data")
@@ -550,20 +1131,69 @@ elif st.session_state.logged_in:
         if data.empty:
             st.warning("No items found.")
         else:
+            # Toggle between views
+            view_mode = st.radio(
+                "Select View Mode",
+                ["Per-Fridge View", "Aggregated View"],
+                index=0
+            )
+
             def highlight_low_stock(row):
                 return ['background-color: #CC0000' if row['quantity'] < stock_threshold else '' for _ in row]
-            paged_df, total_pages = paginate_dataframe(data, page_size=20)
-            st.write(f"Showing {len(paged_df)} rows (Page size: 20)")
 
-            #st.dataframe(paged_df.style.apply(highlight_low_stock, axis=1), width='stretch')
-            st.dataframe(
-                paged_df.style
-                .apply(highlight_low_stock, axis=1)
-                .format({"unit_cost": "{:.2f}", "selling_price": "{:.2f}"}),
-                width="stretch"
+            if view_mode == "Per-Fridge View":
+                # ✅ Add fridge filter
+                fridge_options = sorted(data["fridge_no"].unique())
+                selected_fridge = st.selectbox("Filter by Fridge No", ["All"] + fridge_options)
+
+                if selected_fridge != "All":
+                    data = data[data["fridge_no"] == selected_fridge]
+
+                # ✅ Order by fridge_no
+                data = data.sort_values(by="fridge_no")
+
+                # Paginate after filtering & sorting
+                paged_df, total_pages = paginate_dataframe(data, page_size=100)
+                st.write(f"Showing {len(paged_df)} rows (Page size: 100)")
+
+                st.dataframe(
+                    paged_df.style
+                    .apply(highlight_low_stock, axis=1)
+                    .set_properties(subset=["item_id","quantity"], **{"text-align": "center"}),
+                    width='stretch'
                 )
-            csv_inventory = data.to_csv(index=False)
-            st.download_button("Download Inventory CSV", data=csv_inventory, file_name="inventory.csv", mime="text/csv")
+
+                # Download per-fridge CSV
+                csv_inventory = data.to_csv(index=False)
+                st.download_button(
+                    "Download Per-Fridge Inventory CSV",
+                    data=csv_inventory,
+                    file_name="inventory_per_fridge.csv",
+                    mime="text/csv"
+                )
+
+            else:  # Aggregated View
+                aggregated_df = (
+                    data.groupby(["item_name", "category"], as_index=False)
+                        .agg({"quantity": "sum"})
+                        .rename(columns={"quantity": "total_stock"})
+                )
+                st.write(f"Showing {len(aggregated_df)} aggregated rows")
+                st.dataframe(
+                    aggregated_df.style
+                    .format({"total_stock": "{:,.0f}"})
+                    .set_properties(subset=["total_stock"], **{"text-align": "left"}),
+                    width='stretch'
+                )
+
+                # Download aggregated CSV
+                csv_aggregated = aggregated_df.to_csv(index=False)
+                st.download_button(
+                    "Download Aggregated Inventory CSV",
+                    data=csv_aggregated,
+                    file_name="inventory_aggregated.csv",
+                    mime="text/csv"
+                )
 
     # ---------------- VIEW AUDIT LOG ----------------
     elif menu == "View Audit Log":
@@ -592,7 +1222,7 @@ elif st.session_state.logged_in:
         if data.empty:
             st.warning("No items to delete.")
         else:
-            data['label'] = data.apply(lambda row: f"{row['id']} - {row['category']} - {row['item']}", axis=1)
+            data['label'] = data.apply(lambda row: f"{row['item_id']} - {row['category']} - {row['item_name']}", axis=1)
             selected_label = st.selectbox("Select Item to Delete", data['label'])
             item_id = int(selected_label.split(" - ")[0])
             if st.button("Delete"):
@@ -600,33 +1230,203 @@ elif st.session_state.logged_in:
                 st.success(f"Item with ID {item_id} deleted successfully!")
                 st.rerun()
 
+    # ---------------- DELETE ALL INVENTORY ----------------
+    elif menu == "Delete All Inventory":
+        st.title("Delete All Inventory")
+        if st.button("Confirm Delete All Inventory"):
+            conn = get_connection()
+            conn.execute('DELETE FROM items')
+            conn.commit()
+            conn.close()
+            st.success("All inventory and audit logs deleted successfully!")
+
+    # ---------------- DELETE ALL INVENTORY ----------------
+    elif menu == "Delete Pricing Tiers":
+        st.title("Delete All Pricing Tiers")
+        if st.button("Confirm Delete All Pricing Tiers"):
+            conn = get_connection()
+            conn.execute('DELETE FROM pricing_tiers')
+            conn.commit()
+            conn.close()
+            st.success("All Pricing Tiers deleted successfully!")
+
     # ---------------- ADD CUSTOMER ----------------
     elif menu == "Add Customer":
         st.title("Add New Customer")
         name = st.text_input("Customer Name")
         phone = st.text_input("Phone")
         email = st.text_input("Email")
+        # validate that email is in proper format
+        if email and "@" not in email:
+            st.error("Please enter a valid email address.")
         address = st.text_area("Address")
         if st.button("Save Customer"):
             conn = get_connection()
             conn.execute('INSERT INTO customers (name, phone, email, address) VALUES (?, ?, ?, ?)',
-                         (name, phone, email, address))
+                         (name.upper(), phone, email.upper(), address.upper()))
             conn.commit()
             conn.close()
             st.success(f"Customer '{name}' added successfully!")
 
     # ---------------- VIEW CUSTOMERS ----------------
-    elif menu == "View Customers":
+    elif menu == "Manage Customers":
         st.title("Customer List")
         data = view_customers()
         if data.empty:
             st.warning("No customers found.")
         else:
-            paged_customers, total_pages = paginate_dataframe(data, page_size=20)
-            st.write(f"Showing {len(paged_customers)} rows (Page size: 20)")
-            st.dataframe(paged_customers)
+            #paged_customers, total_pages = paginate_dataframe(data, page_size=20)
+            #st.write(f"Showing {len(paged_customers)} rows (Page size: 20)")
+            #st.dataframe(paged_customers)
+        # ---- maintain customers -----
 
-## Added customer id dropdown
+            customer_label = st.selectbox(
+            "Select Customer",
+            data.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
+            )
+            customer_id = int(customer_label.split(" - ")[0])
+
+            # Show existing tiers
+            conn = get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM customers WHERE id=?", (customer_id,))
+            customers = cursor.fetchall()
+            conn.close()
+
+            if customers:
+                st.subheader("Existing Customers")
+                customers_df = pd.DataFrame(customers, columns=customers[0].keys())
+                st.dataframe(customers_df, width='stretch')
+            else:
+                st.info("No customers defined yet.")
+
+            st.markdown("---")
+
+            # ✅ Collapsible Add/Update section
+            with st.expander("➕ Add / Update Customers", expanded=False):
+                name = st.text_input("Name", value="")
+                phone = st.text_input("Contact No", value="")
+                email = st.text_input("Email Address", value="")
+                address = st.text_input("Address", value="")
+
+                if st.button("Save Customer"):
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    if validate_if_customer_exist(name):   # if existing, means it's an update
+                        cursor.execute(
+                            "UPDATE customers set phone=?, email=?, address=? where name=?",
+                            (phone.strip(), email.strip().upper(), address.strip().upper(), name.strip().upper())
+                        ) 
+                        st.write(f"{phone} {email} {address}")
+                        conn.commit()
+                        conn.close()
+                        st.success(f"Updated existing profile for {name}.")
+                        st.rerun()
+                    else:
+                        cursor.execute(
+                            "INSERT INTO customers (name, phone, email, address) VALUES (?, ?, ?, ?)",
+                            (name.strip().upper(), phone.strip(), email.strip().upper(), address.strip().upper())
+                        )                
+                        conn.commit()
+                        conn.close()
+                        st.success("Added new Customer successfully!")
+                        st.rerun()
+
+
+            # ✅ Collapsible Delete section
+            if customers:
+                with st.expander("🗑️ Delete a Customer", expanded=False):
+                    st.subheader("Delete a Customer")
+                    customer_to_delete = "Select Customer to Delete" 
+                    customer_ids = ["Select Customer to Delete"] + [
+                        f"{t['id']} - {t['name']}" for t in customers
+                    ]
+                    customer_to_delete = st.selectbox("Select Customer to Delete", customer_ids)
+                    if st.button("Delete Customer"):
+                        customer_id = int(customer_to_delete.split()[0])
+                        conn = get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM customers WHERE id=?", (customer_id,))
+                        conn.commit()
+                        conn.close()
+                        st.success("Customer deleted successfully!")
+                        st.rerun()
+
+    # ---------------- VIEW SALES FOR A CUSTOMER ----------------
+    elif menu == "View Sale for a Customer":
+        st.title("View Sales for a Customer")
+        customers_df = view_customers()
+        if customers_df.empty:
+            st.warning("No customers found.")
+        else:
+            customer_label = st.selectbox(
+                "Select Customer",
+                customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
+            )
+            customer_id = int(customer_label.split(" - ")[0])
+            sales_df = view_sales_by_customers(customer_id)
+            if sales_df.empty:
+                st.warning("No sales records found for this customer.")
+            else:
+                paged_sales, total_pages = paginate_dataframe(sales_df, page_size=20)
+                st.write(f"Showing {len(paged_sales)} rows (Page size: 20)")
+
+                # ✅ Format total_sale with 2 decimals              
+                styled_sales = (
+                    paged_sales.style
+                    .format({
+                        "total_sale": "{:,.2f}",
+                        "selling_price": "{:,.2f}",
+                        "cost": "{:,.2f}",
+                        "profit": "{:,.2f}"
+                    })
+                )
+
+                st.dataframe(styled_sales, width='stretch')
+                csv_sales = sales_df.to_csv(index=False)
+                st.download_button("Download Sales CSV", data=csv_sales, file_name="sales_customer.csv", mime="text/csv")
+    
+    # ---------------- Generate PO for Customer based on Sales Date ----------------
+    elif menu == "Generate Purchase Order":
+        st.title("Generate Purchase Order (PO)")
+        customers_df = view_customers()
+        if customers_df.empty:
+            st.warning("No customers found.")
+        else:
+            customer_label = st.selectbox(
+                "Select Customer",
+                customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
+            )
+            customer_id = int(customer_label.split(" - ")[0])
+
+            # select order date from the list of customer orders
+            sales_df = view_sales_by_customers(customer_id)
+            if sales_df.empty:
+                st.warning("No sales records found for this customer.")
+            else:
+                order_dates = sales_df['date'].unique()
+                order_date = st.selectbox("Select Order Date", order_dates)
+
+                # normalize order_date
+                if isinstance(order_date, date):
+                    order_date_sql = order_date.strftime("%Y-%m-%d")
+                else:
+                    order_date_sql = str(order_date)
+                    
+                pickup_date = st.date_input("Pickup Date")
+                # normalize pickup_date (st.date_input returns a date)
+                pickup_date_sql = pickup_date.strftime("%Y-%m-%d")
+
+                #order_date = datetime.strptime(order_date_str, "%Y-%m-%d").date()
+
+            if st.button("Generate PO"):
+                pdf_file = generate_po_pdf(order_date_sql, customer_id, pickup_date_sql)
+                with open(pdf_file, "rb") as f:
+                    st.download_button("Download PO PDF", data=f, file_name=pdf_file, mime="application/pdf")
+
+    # ---------------- RECORD SALE ----------------
+    ## Added customer id dropdown
     elif menu == "Record Sale":
         st.title("Record Sale")
         items_df = view_items()
@@ -637,35 +1437,97 @@ elif st.session_state.logged_in:
         elif customers_df.empty:
             st.warning("No customers available. Please add a customer first.")
         else:
+            # Build display labels: "<item_id> - <item_name>"
+            items_df["display"] = items_df.apply(
+                lambda row: f"{row['item_id']} - {row['item_name']}", axis=1
+            )
+
             # Item selection
-            item = st.selectbox("Select Item", items_df['item'])
+            item_display = st.selectbox(
+                "Select Item",
+                ["Select item"] + items_df["display"].tolist()
+            )
+
+            total_qty = 0
+            selected_item_id, selected_item_name = None, None
+            if item_display != "Select item":
+                selected_item_id = int(item_display.split(" - ")[0])
+                selected_item_name = item_display.split(" - ")[1]
 
             # Customer selection
             customer_label = st.selectbox(
                 "Select Customer",
-                customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
+                ["Select customer"] + customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1).tolist()
             )
-            customer_id = int(customer_label.split(" - ")[0])
+            if customer_label == "Select customer":
+                st.warning("Please select a valid customer.")
+            else:
+                customer_id = int(customer_label.split(" - ")[0])
+                customer_name = customer_label.split(" - ")[1]
+                st.success(f"Selected customer: ID={customer_id}, Name={customer_name}")
 
             # Quantity input
             quantity = st.number_input("Quantity Sold", min_value=1)
 
-            # Record Sale button
-            if st.button("Record Sale"):
-                result = record_sale(item, quantity, st.session_state.username, customer_id)
-                st.success(result)
+            if customer_label != "Select customer" and item_display != "Select item":
+                total_qty = get_total_qty(selected_item_name)
+                st.info(f"Stock Currently On Hand: {total_qty}")
+                if total_qty < quantity and quantity != 0:
+                    st.error("Not enough stock")
+                # Lookup tiered price
+                conn = get_connection()
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT price_per_unit 
+                    FROM pricing_tiers
+                    WHERE item_id = ?
+                    AND min_qty <= ?
+                    AND (max_qty IS NULL OR ? <= max_qty)
+                    ORDER BY min_qty DESC
+                    LIMIT 1
+                """, (selected_item_id, quantity, quantity))
+                tier = cursor.fetchone()
+                conn.close()
 
-            # Show Sales Records
-            st.subheader("Sales Records")
-            sales_df = view_sales()
-            if not sales_df.empty:
-                paged_sales, total_pages = paginate_dataframe(sales_df, page_size=20)
-                st.write(f"Showing {len(paged_sales)} rows (Page size: 20)")
-                st.dataframe(paged_sales)
-                csv_sales = sales_df.to_csv(index=False)
-                st.download_button("Download Sales CSV", data=csv_sales, file_name="sales.csv", mime="text/csv")
-            else:
-                st.info("No sales recorded yet.")
+                if tier: 
+                    price_per_unit = tier["price_per_unit"]
+                    auto_total = quantity * price_per_unit
+
+                    if total_qty >= quantity:
+                        st.info(f"Tiered Price per Unit: PHP {price_per_unit:,.2f}")
+                        st.info(f"Calculated Total Sale: PHP {auto_total:,.2f}")
+
+                    # Override option
+                    use_override = st.checkbox("Override Per Unit amount?")
+                    override_total = None
+                    if use_override:
+                        override_total = st.number_input("Enter custom per unit price", min_value=0.0, format="%.2f")
+
+                    if st.button("Record Sale"):
+                        msg = record_sale(selected_item_id, quantity, st.session_state.username, customer_id, override_total)
+                        st.subheader("Sales Records")
+                        sales_df = view_sales_by_customer(customer_id)
+                        if not sales_df.empty:
+                            paged_sales, total_pages = paginate_dataframe(sales_df, page_size=100)
+                            st.write(f"Showing {len(paged_sales)} rows (Page size: 100)")
+
+                            # ✅ Format selling_price and total_sale with commas and 2 decimals
+                            styled_sales = paged_sales.style.format({
+                                "selling_price": "{:,.2f}",
+                                "total_sale": "{:,.2f}",
+                                "cost": "{:,.2f}",
+                                "profit": "{:,.2f}"
+                            })
+                            st.dataframe(styled_sales, width='stretch')
+
+                            csv_sales = sales_df.to_csv(index=False)
+                            st.download_button("Download Sales CSV", data=csv_sales, file_name="sales.csv", mime="text/csv")
+                        else:
+                            st.info("No sales recorded yet.")
+                        st.success(msg)
+                else:
+                    st.error("No pricing tier found for this item/quantity.")
 
     # ---------------- PROFIT/LOSS REPORT ----------------
     elif menu == "Profit/Loss Report":
@@ -688,7 +1550,6 @@ elif st.session_state.logged_in:
 ## Aileen Added
 
     # ---------------- CUSTOMER SOA ----------------
-    # --- CUSTOMER SOA ---
     elif menu == "Customer Statement of Account":
         st.title("Customer Statement of Account")
         customers_df = view_customers()
@@ -703,21 +1564,27 @@ elif st.session_state.logged_in:
             customer_id = int(customer_label.split(" - ")[0])
             customer_name = customer_label.split(" - ")[1]
 
-            # Date filters
-            start_date = st.date_input("Start Date")
-            end_date = st.date_input("End Date")
+            # --- Default start and end of current month ---
+            today = date.today()
+            start_of_month = today.replace(day=1)
+            last_day = calendar.monthrange(today.year, today.month)[1]
+            end_of_month = today.replace(day=last_day)
+
+            # Date filters with defaults
+            start_date = st.date_input("Start Date", value=start_of_month)
+            end_date = st.date_input("End Date", value=end_of_month)
 
             # Fetch filtered sales data
             def view_sales_by_customer_and_date(customer_id, start_date=None, end_date=None):
                 conn = get_connection()
                 if start_date and end_date:
                     query = """
-                    SELECT * FROM sales
+                    SELECT date, item_id, item_name, quantity, selling_price, total_sale, overridden FROM sales
                     WHERE customer_id = ? AND date BETWEEN ? AND ?
                     """
                     df = pd.read_sql_query(query, conn, params=(customer_id, start_date, end_date))
                 else:
-                    query = "SELECT * FROM sales WHERE customer_id = ?"
+                    query = "SELECT date, item_id, item_name, quantity, selling_price, total_sale, overridden FROM sales WHERE customer_id = ?"
                     df = pd.read_sql_query(query, conn, params=(customer_id,))
                 conn.close()
                 return df
@@ -730,7 +1597,15 @@ elif st.session_state.logged_in:
                 st.subheader("Sales Records of Selected Customer")
                 paged_sales_customer, total_pages = paginate_dataframe(sales_customer, page_size=20)
                 st.write(f"Showing {len(paged_sales_customer)} rows (Page size: 20)")
-                st.dataframe(paged_sales_customer)
+
+                # ✅ Format selling_price and total_sale with commas and 2 decimals
+                styled_sales = paged_sales_customer.style.format({
+                    "selling_price": "{:,.2f}",
+                    "total_sale": "{:,.2f}",
+                    "cost": "{:,.2f}",
+                    "profit": "{:,.2f}"
+                })
+                st.dataframe(styled_sales, width='stretch')
 
                 # Download CSV
                 csv_sales = sales_customer.to_csv(index=False)
@@ -744,7 +1619,7 @@ elif st.session_state.logged_in:
 
     # --- New Menu Options ---
     # --- Enhanced View Price History with Pagination and CSV Export ---
-    elif menu == "View Price History":
+    elif menu == "View Price History2":
         st.title("Price History")
         conn = get_connection()
         df = pd.read_sql_query('SELECT ph.timestamp, i.item, ph.old_quantity, ph.new_price_quantity, ph.old_unit_cost, ph.old_selling_price, ph.new_unit_cost, ph.new_selling_price, ph.changed_by FROM price_history ph JOIN items i ON ph.item_id = i.id ORDER BY ph.timestamp DESC', conn)
@@ -754,12 +1629,12 @@ elif st.session_state.logged_in:
         else:
             paged_df, total_pages = paginate_dataframe(df, page_size=20)
             st.write(f"Showing {len(paged_df)} rows (Page size: 20)")
-            st.dataframe(paged_df.style.format({"old_unit_cost": "{:.2f}", "old_selling_price": "{:.2f}", "new_unit_cost": "{:.2f}", "new_selling_price": "{:.2f}"}))
+            st.dataframe(paged_df.style.format({"old_unit_cost": "{:,.2f}", "old_selling_price": "{:,.2f}", "new_unit_cost": "{:,.2f}", "new_selling_price": "{:,.2f}"}))
             csv_data = df.to_csv(index=False)
             st.download_button("Download Price History CSV", data=csv_data, file_name="price_history.csv", mime="text/csv")
 
     # --- Enhanced Price Change Impact Report with Pagination and CSV Export ---
-    elif menu == "Price Change Impact Report":
+    elif menu == "Price Change Impact Report2":
         st.title("Price Change Impact Report")
         items_df = view_items()
         if items_df.empty:
@@ -786,5 +1661,4 @@ elif st.session_state.logged_in:
                     st.write("**After Change:**")
                     st.dataframe(after_sales)
             conn.close()
-
 
