@@ -45,7 +45,7 @@ if "quantity" not in st.session_state:
 
 if "fridge_no" not in st.session_state:
     st.session_state.fridge_no = ""
-    
+
 # ---------------- DATABASE FUNCTIONS ----------------
 def get_connection():
     return sqlite3.connect('inventory.db')
@@ -436,7 +436,8 @@ def manage_pricing_tiers():
         items_df.apply(lambda row: f"{row['item_id']} - {row['item_name']}", axis=1)
     )
     item_id = int(item_label.split(" - ")[0])
-
+    item_name = item_label.split(" - ")[1]
+    
     # Show existing tiers
     conn = get_connection()
     conn.row_factory = sqlite3.Row
@@ -462,16 +463,22 @@ def manage_pricing_tiers():
         min_qty = st.number_input("Minimum Quantity", min_value=1)
         max_qty = st.number_input("Maximum Quantity (0 = unlimited)", min_value=0)
         price_per_unit = st.number_input("Price per Unit", min_value=0.0, format="%.2f")
-        label = st.text_input("Tier Label (optional)", value="")
+        label = st.text_input("Tier Label (optional)", value=item_name)
 
         if st.button("Save Tier"):
             conn = get_connection()
             cursor = conn.cursor()
             if validate_if_exist(item_id, min_qty, max_qty):   # if existing, means it's an update
-                cursor.execute(
-                    "UPDATE pricing_tiers set price_per_unit=?, label=? where item_id=? and min_qty=? and max_qty=?",
-                    (price_per_unit, label, item_id, min_qty, max_qty)
-                ) 
+                if max_qty == 0 or max_qty is None:
+                    cursor.execute(
+                        "UPDATE pricing_tiers SET price_per_unit=?, label=? WHERE item_id=? AND min_qty=? AND max_qty IS NULL",
+                        (price_per_unit, label.strip().upper(), item_id, min_qty)
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE pricing_tiers SET price_per_unit=?, label=? WHERE item_id=? AND min_qty=? AND max_qty=?",
+                        (price_per_unit, label.strip().upper(), item_id, min_qty, max_qty)
+                    )
                 conn.commit()
                 conn.close()
                 st.success(f"Updated existing pricing tier for {item_id}.")
@@ -479,8 +486,8 @@ def manage_pricing_tiers():
             else:
                 cursor.execute(
                     "INSERT INTO pricing_tiers (item_id, min_qty, max_qty, price_per_unit, label) VALUES (?, ?, ?, ?, ?)",
-                    (item_id, min_qty, None if max_qty == 0 else max_qty, price_per_unit, label)
-                )                
+                    (item_id, min_qty, None if max_qty == 0 else max_qty, price_per_unit, label.strip().upper())
+                )               
                 conn.commit()
                 conn.close()
                 st.success("Added new Pricing tier successfully!")
@@ -515,7 +522,10 @@ def validate_if_exist(item_id, min_qty, max_qty):
     """
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, min_qty, max_qty FROM pricing_tiers WHERE item_id=? and min_qty=? and max_qty=?", (item_id, min_qty, max_qty))
+    if max_qty == 0 or max_qty is None:
+        cur.execute("SELECT id, min_qty, max_qty FROM pricing_tiers WHERE item_id=? and min_qty=? AND max_qty IS NULL", (item_id, min_qty))
+    else:
+        cur.execute("SELECT id, min_qty, max_qty FROM pricing_tiers WHERE item_id=? and min_qty=? and max_qty=?", (item_id, min_qty, max_qty))
     rows = cur.fetchall()
     if rows:
         conn.close()
