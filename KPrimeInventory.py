@@ -33,6 +33,19 @@ if 'menu' not in st.session_state:
 if 'username' not in st.session_state:
     st.session_state.username = ""
 
+# Initialize session state variables
+if "item_name" not in st.session_state:
+    st.session_state.item_name = ""
+
+if "category" not in st.session_state:
+    st.session_state.category = ""
+
+if "quantity" not in st.session_state:
+    st.session_state.quantity = 1   # sensible default
+
+if "fridge_no" not in st.session_state:
+    st.session_state.fridge_no = ""
+    
 # ---------------- DATABASE FUNCTIONS ----------------
 def get_connection():
     return sqlite3.connect('inventory.db')
