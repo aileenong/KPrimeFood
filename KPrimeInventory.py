@@ -101,13 +101,13 @@ def create_tables():
     """)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS pricing_tiers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    item_id INTEGER NOT NULL,
-    min_qty INTEGER NOT NULL,
-    max_qty INTEGER,  -- NULL means no upper limit
-    price_per_unit REAL NOT NULL,
-    label TEXT,
-    FOREIGN KEY (item_id) REFERENCES items(item_id)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id INTEGER NOT NULL,
+        min_qty INTEGER NOT NULL,
+        max_qty INTEGER,  -- NULL means no upper limit
+        price_per_unit REAL NOT NULL,
+        label TEXT,
+        FOREIGN KEY (item_id) REFERENCES items(item_id)
     )
     """)
     conn.commit()
@@ -281,15 +281,21 @@ def record_sale(item_id, quantity, user, customer_id, override_total=None):
     """, (item_id, quantity, quantity))
     tier = cursor.fetchone()
     if tier is None:
-        conn.close()
-        return f"No pricing tier found for {quantity} units of item {item_id}."
-
-    price_per_unit = tier['price_per_unit']
-    selling_price = override_total if override_total is not None else price_per_unit
-    total_sale = quantity * selling_price
-    overridden_flag = 1 if override_total is not None else 0
-    cost = 0.0
-    profit = 0.0
+        #conn.close()
+        #st.warning(f"No pricing tier found for {quantity} units of item {item_id}.")
+        price_per_unit = 0.00
+        selling_price = 0.00
+        total_sale = quantity * selling_price
+        overridden_flag = 1 if override_total is not None else 0
+        cost = 0.0
+        profit = 0.0
+    else:
+        price_per_unit = tier['price_per_unit']
+        selling_price = override_total if override_total is not None else price_per_unit
+        total_sale = quantity * selling_price
+        overridden_flag = 1 if override_total is not None else 0
+        cost = 0.0
+        profit = 0.0
 
     # Deduct stock across fridges
     qty_to_deduct = quantity
@@ -1513,44 +1519,46 @@ elif st.session_state.logged_in:
                 tier = cursor.fetchone()
                 conn.close()
 
-                if tier: 
-                    price_per_unit = tier["price_per_unit"]
-                    auto_total = quantity * price_per_unit
-
-                    if total_qty >= quantity:
-                        st.info(f"Tiered Price per Unit: PHP {price_per_unit:,.2f}")
-                        st.info(f"Calculated Total Sale: PHP {auto_total:,.2f}")
-
-                    # Override option
-                    use_override = st.checkbox("Override Per Unit amount?")
-                    override_total = None
-                    if use_override:
-                        override_total = st.number_input("Enter custom per unit price", min_value=0.0, format="%.2f")
-
-                    if st.button("Record Sale"):
-                        msg = record_sale(selected_item_id, quantity, st.session_state.username, customer_id, override_total)
-                        st.subheader("Sales Records")
-                        sales_df = view_sales_by_customer(customer_id)
-                        if not sales_df.empty:
-                            paged_sales, total_pages = paginate_dataframe(sales_df, page_size=100)
-                            st.write(f"Showing {len(paged_sales)} rows (Page size: 100)")
-
-                            # ✅ Format selling_price and total_sale with commas and 2 decimals
-                            styled_sales = paged_sales.style.format({
-                                "selling_price": "{:,.2f}",
-                                "total_sale": "{:,.2f}",
-                                "cost": "{:,.2f}",
-                                "profit": "{:,.2f}"
-                            })
-                            st.dataframe(styled_sales, width='stretch')
-
-                            csv_sales = sales_df.to_csv(index=False)
-                            st.download_button("Download Sales CSV", data=csv_sales, file_name="sales.csv", mime="text/csv")
-                        else:
-                            st.info("No sales recorded yet.")
-                        st.success(msg)
+                if tier == None:
+                    st.warning("No pricing tier found for this item/quantity.")
+                    price_per_unit = 0.00
                 else:
-                    st.error("No pricing tier found for this item/quantity.")
+                    price_per_unit = tier["price_per_unit"]
+                
+                auto_total = quantity * price_per_unit
+                if total_qty >= quantity:
+                    st.info(f"Tiered Price per Unit: PHP {price_per_unit:,.2f}")
+                    st.info(f"Calculated Total Sale: PHP {auto_total:,.2f}")
+
+                # Override option
+                use_override = st.checkbox("Override Per Unit amount?")
+                override_total = None
+                if use_override:
+                    override_total = st.number_input("Enter custom per unit price", min_value=0.0, format="%.2f")
+
+                if st.button("Record Sale"):
+                    msg = record_sale(selected_item_id, quantity, st.session_state.username, customer_id, override_total)
+                    st.subheader("Sales Records")
+                    sales_df = view_sales_by_customer(customer_id)
+                    if not sales_df.empty:
+                        paged_sales, total_pages = paginate_dataframe(sales_df, page_size=100)
+                        st.write(f"Showing {len(paged_sales)} rows (Page size: 100)")
+
+                        # ✅ Format selling_price and total_sale with commas and 2 decimals
+                        styled_sales = paged_sales.style.format({
+                            "selling_price": "{:,.2f}",
+                            "total_sale": "{:,.2f}",
+                            "cost": "{:,.2f}",
+                            "profit": "{:,.2f}"
+                        })
+                        st.dataframe(styled_sales, width='stretch')
+
+                        csv_sales = sales_df.to_csv(index=False)
+                        st.download_button("Download Sales CSV", data=csv_sales, file_name="sales.csv", mime="text/csv")
+                    else:
+                        st.info("No sales recorded yet.")
+                    st.success(msg)
+
 
     # ---------------- PROFIT/LOSS REPORT ----------------
     elif menu == "Profit/Loss Report":
