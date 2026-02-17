@@ -1,6 +1,7 @@
 import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
+from datetime import datetime
 
 # ---------------- SUPABASE CONNECTION ----------------
 SUPABASE_URL = st.secrets["supabase"]["url"]
@@ -89,26 +90,47 @@ def get_customer(customer_id: int) -> dict:
 
 # ---------------- CRUD FUNCTIONS ----------------
 def add_or_update_item(item_id, item_name, category, quantity, fridge_no, user):
-    if item_id:
-        res = supabase.table("items").select("*").eq("item_id", item_id).execute()
-    else:
-        res = supabase.table("items").select("*").eq("item_name", item_name).eq("category", category).eq("fridge_no", fridge_no).execute()
+    # Normalize fridge_no to int if possible
+    try:
+        fridge_no = int(fridge_no)
+    except:
+        pass
 
-    if res.data:
-        existing = res.data[0]
-        new_quantity = existing["quantity"] + quantity
-        supabase.table("items").update({"quantity": new_quantity, "fridge_no": fridge_no}).eq("item_id", existing["item_id"]).execute()
-        action = "Update"
-        supabase.table("audit_log").insert({
-            "item_name": existing["item_name"],
-            "category": category,
-            "action": action,
-            "quantity": quantity,
-            "unit_cost": 0.00,
-            "selling_price": 0.00,
-            "username": user
-        }).execute()
+    # Case 1: If item_id provided, check if record exists
+    if item_id and item_id != "Add New":
+        existing = supabase.table("items").select("*").eq("item_id", item_id).execute()
+        if existing.data:
+            current_record = existing.data[0]
+            current_qty = current_record["quantity"]
+            current_fridge = current_record["fridge_no"]
+
+            if str(current_fridge) == str(fridge_no):
+                # Same fridge → add to existing quantity
+                new_qty = current_qty + quantity
+                supabase.table("items").update({
+                    "quantity": new_qty
+                }).eq("item_id", item_id).execute()
+                action = "Update"
+            else:
+                # Different fridge → create new item row
+                supabase.table("items").insert({
+                    "item_name": item_name,
+                    "category": category,
+                    "quantity": quantity,
+                    "fridge_no": fridge_no
+                }).execute()
+                action = "Add (New Fridge)"
+        else:
+            # No record found → insert new
+            supabase.table("items").insert({
+                "item_name": item_name,
+                "category": category,
+                "quantity": quantity,
+                "fridge_no": fridge_no
+            }).execute()
+            action = "Add"
     else:
+        # Case 2: New item
         supabase.table("items").insert({
             "item_name": item_name,
             "category": category,
@@ -116,15 +138,18 @@ def add_or_update_item(item_id, item_name, category, quantity, fridge_no, user):
             "fridge_no": fridge_no
         }).execute()
         action = "Add"
-        supabase.table("audit_log").insert({
-            "item_name": item_name,
-            "category": category,
-            "action": action,
-            "quantity": quantity,
-            "unit_cost": 0.00,
-            "selling_price": 0.00,
-            "username": user
-        }).execute()
+
+    # Audit log entry
+    supabase.table("audit_log").insert({
+        "item_name": item_name,
+        "category": category,
+        "action": action,
+        "quantity": quantity,
+        "unit_cost": 0.0,
+        "selling_price": 0.0,
+        "username": user,
+        "timestamp": datetime.now().isoformat()
+    }).execute()
 
 def delete_item(item_id, user):
     res = supabase.table("items").select("*").eq("item_id", item_id).execute()

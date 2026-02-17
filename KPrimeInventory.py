@@ -355,11 +355,19 @@ elif st.session_state.logged_in:
         if data.empty:
             st.warning("No items found.")
         else:
-            paged_df, total_pages = paginate_dataframe(data, page_size=100)
-            st.write(f"Showing {len(paged_df)} rows (Page size: 100)")
-            st.dataframe(paged_df[['item_id','item_name','category','quantity','fridge_no']])
-            csv_inventory = data.to_csv(index=False)
-            st.download_button("Download Inventory CSV", data=csv_inventory, file_name="inventory.csv", mime="text/csv")
+            view_mode = st.radio("Select View Mode", ["Per-Fridge View", "Aggregated View"], index=0)
+            if view_mode == "Per-Fridge View":
+                fridge_options = sorted(data["fridge_no"].unique())
+                selected_fridge = st.selectbox("Filter by Fridge No", ["All"] + fridge_options)
+                if selected_fridge != "All":
+                    data = data[data["fridge_no"] == selected_fridge]
+                data = data.sort_values(by="fridge_no")
+                paged_df, _ = paginate_dataframe(data, page_size=100)
+                st.dataframe(paged_df)
+            else:
+                aggregated_df = data.groupby(["item_name", "category"], as_index=False).agg({"quantity": "sum"}).rename(columns={"quantity": "total_stock"})
+                st.dataframe(aggregated_df)
+
 
     # ---------------- MANAGE STOCK ----------------
     elif menu == "Manage Stock":
