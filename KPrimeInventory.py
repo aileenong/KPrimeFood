@@ -1,20 +1,16 @@
 import streamlit as st
 from streamlit_option_menu import option_menu
-import sqlite3
-import qrcode
 import pandas as pd
 import plotly.express as px
-import fitz  # PyMuPDF for PDF generation
+import fitz  # PyMuPDF
 import os
 import io
 import base64
 import cv2
 from pyzbar.pyzbar import decode
 import datetime
-from datetime import datetime
-from datetime import date
+from datetime import datetime, date
 import calendar
-
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -24,6 +20,22 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.pdfgen import canvas
 
+# ✅ Import Supabase database functions
+from db_supabase import (
+    view_items,
+    view_pricing,
+    view_sales,
+    view_sales_by_customer,
+    view_customers,
+    delete_all_customers,
+    view_sales_by_customers,
+    view_audit_log,
+    add_or_update_item,
+    delete_item,
+    delete_all_inventory,
+    get_total_qty,
+    record_sale
+)
 
 # ---------------- SESSION STATE INIT ----------------
 if 'logged_in' not in st.session_state:
@@ -33,143 +45,14 @@ if 'menu' not in st.session_state:
 if 'username' not in st.session_state:
     st.session_state.username = ""
 
-# Initialize session state variables
 if "item_name" not in st.session_state:
     st.session_state.item_name = ""
-
 if "category" not in st.session_state:
     st.session_state.category = ""
-
 if "quantity" not in st.session_state:
-    st.session_state.quantity = 1   # sensible default
-
+    st.session_state.quantity = 1
 if "fridge_no" not in st.session_state:
     st.session_state.fridge_no = ""
-
-# ---------------- DATABASE FUNCTIONS ----------------
-def get_connection():
-    return sqlite3.connect('inventory.db')
-
-def create_tables():
-    conn = get_connection()
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS items (
-        item_id INTEGER PRIMARY KEY AUTOINCREMENT,  
-        item_name TEXT,
-        category TEXT,
-        quantity INTEGER,
-        fridge_no INTEGER
-    )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS sales (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_id INTEGER NOT NULL,
-        item_name TEXT,
-        quantity INTEGER,
-        selling_price REAL,
-        total_sale REAL,
-        cost REAL,
-        profit REAL,
-        date TEXT,
-        customer_id INTEGER,
-        overridden INTEGER DEFAULT 0,
-        FOREIGN KEY (item_id) REFERENCES items(item_id)
-    )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS customers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        phone TEXT,
-        email TEXT,
-        address TEXT
-    )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS audit_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_name TEXT,
-        category TEXT,
-        action TEXT,
-        quantity INTEGER,
-        unit_cost REAL,
-        selling_price REAL,
-        user TEXT,
-        timestamp TEXT
-    )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS pricing_tiers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_id INTEGER NOT NULL,
-        min_qty INTEGER NOT NULL,
-        max_qty INTEGER,  -- NULL means no upper limit
-        price_per_unit REAL NOT NULL,
-        label TEXT,
-        FOREIGN KEY (item_id) REFERENCES items(item_id)
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-def view_items():
-    conn = get_connection()
-    df = pd.read_sql_query('SELECT * FROM items', conn)
-    conn.close()
-    return df
-
-def view_pricing():
-    conn = get_connection()
-    df = pd.read_sql_query('SELECT * FROM pricing_tiers',conn)
-    conn.close()
-    return df
-
-def view_sales():
-    conn = get_connection()
-    df = pd.read_sql_query('SELECT * FROM sales', conn)
-    conn.close()
-    return df
-
-def view_sales_by_customer (customer_id):
-    conn = get_connection()
-    query = f'SELECT * FROM sales WHERE customer_id = {customer_id}'
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
-
-def view_customers():
-    conn = get_connection()
-    df = pd.read_sql_query('SELECT * FROM customers', conn)
-    conn.close()
-    return df
-
-def view_sales_by_customers(customer_id=None):
-    conn = get_connection()
-    
-    if customer_id:
-        query = 'SELECT * FROM sales WHERE customer_id = ?'
-        df = pd.read_sql_query(query, conn, params=(customer_id,))
-    else:
-        query = 'SELECT * FROM sales'
-        df = pd.read_sql_query(query, conn)
-    
-    conn.close()
-    return df
-
-def view_audit_log(start_date=None, end_date=None):
-    conn = get_connection()
-    if start_date and end_date:
-        query = """
-        SELECT * FROM audit_log
-        WHERE DATE(timestamp) BETWEEN ? AND ?
-        ORDER BY timestamp DESC
-        """
-        df = pd.read_sql_query(query, conn, params=(start_date, end_date))
-    else:
-        df = pd.read_sql_query('SELECT * FROM audit_log ORDER BY timestamp DESC', conn)
-    conn.close()
-    return df
 
 # ---------------- Pagination Utility ----------------
 def paginate_dataframe(df, page_size=20):
@@ -182,252 +65,13 @@ def paginate_dataframe(df, page_size=20):
     end_idx = start_idx + page_size
     return df.iloc[start_idx:end_idx], total_pages
 
-# ---------------- CRUD FUNCTIONS ----------------
-def add_or_update_item(item_id, item_name, category, quantity, fridge_no, user):
-    conn = get_connection()
-    cursor = conn.cursor()
-    if item_id == None:
-        cursor.execute('SELECT item_id, item_name, quantity, fridge_no FROM items WHERE item_name=? AND category=? AND fridge_no=?', (item_name, category, fridge_no))
-    else:
-        cursor.execute('SELECT item_id, item_name, quantity, fridge_no FROM items WHERE item_id=? AND category=? AND fridge_no=?', (item_id, category, fridge_no))
-    existing = cursor.fetchone()
-    if existing:
-        # existing is a tuple (item_id, item_name, quantity)
-        existing_id, existing_name, current_qty, fridge_no = existing
-        new_quantity = current_qty + quantity
+# ---------------- LOGOUT FUNCTION ----------------
+def logout():
+    st.session_state.logged_in = False
+    st.session_state.menu = "Landing"
+    st.session_state.username = ""
 
-        cursor.execute('UPDATE items SET quantity=?, fridge_no=? WHERE item_id=?',
-                       (new_quantity, fridge_no, existing[0]))
-        action = "Update"
-        # Log into audit any changes
-        cursor.execute('INSERT INTO audit_log (item_name, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
-                    (existing_name, category, action, quantity, 0.00, 0.00, user))
-
-    else:
-        cursor.execute('INSERT INTO items (item_name, category, quantity, fridge_no) VALUES (?, ?, ?, ?)',
-                       (item_name, category, quantity, fridge_no))
-        new_item_id = cursor.lastrowid   # ✅ get the auto-generated item_id
-        action = "Add"
-        # Log into audit any changes
-        cursor.execute('INSERT INTO audit_log (item_name, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
-                    (item_name, category, action, quantity, 0.00, 0.00, user))
-    conn.commit()
-    conn.close()
-
-def delete_item(item_id, user):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT item_name, category, quantity FROM items WHERE item_id=?', (item_id,))
-    item_details = cursor.fetchone()
-    if item_details:
-        cursor.execute('INSERT INTO audit_log (item_name, category, action, quantity, unit_cost, selling_price, user, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME("now"))',
-                       (item_details[0], item_details[1], "Delete", item_details[2], 0.00, 0.00, user))
-        cursor.execute('DELETE FROM items WHERE item_id=?', (item_id,))
-    conn.commit()
-    conn.close()
-
-# Get total quantity based on item_name
-def get_total_qty(selected_item_name):
-    conn = get_connection()
-    conn.row_factory = sqlite3.Row   # ensure dict-like access
-    cursor = conn.cursor()
-
-    # Get all records for this item_name (could be multiple fridges)
-    cursor.execute("SELECT * FROM items WHERE item_name=?", (selected_item_name,))
-    rows = cursor.fetchall()
-
-    if not rows:
-        conn.close()
-        return "Item not found."
-
-    # ✅ Sum total quantity across all fridges
-    total_quantity = sum(row['quantity'] for row in rows)
-    conn.close()
-    return total_quantity
-
-# Record sales
-def record_sale(item_id, quantity, user, customer_id, override_total=None):
-    conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-
-    # Get item details
-    cursor.execute("SELECT * FROM items WHERE item_id=?", (item_id,))
-    row = cursor.fetchone()
-    if row is None:
-        conn.close()
-        return "Item not found."
-
-    item_name = row['item_name']
-    category = row['category']
-
-    # Get all fridge records for this item_name
-    cursor.execute("SELECT * FROM items WHERE item_name=?", (item_name,))
-    rows = cursor.fetchall()
-    total_quantity = sum(r['quantity'] for r in rows)
-    if total_quantity < quantity:
-        conn.close()
-        return "Not enough stock."
-
-    # Get pricing tier
-    cursor.execute("""
-        SELECT price_per_unit 
-        FROM pricing_tiers
-        WHERE item_id = ?
-          AND min_qty <= ?
-          AND (max_qty IS NULL OR max_qty = 0 OR ? <= max_qty)
-        ORDER BY min_qty DESC
-        LIMIT 1
-    """, (item_id, quantity, quantity))
-    tier = cursor.fetchone()
-    if tier is None:
-        #conn.close()
-        #st.warning(f"No pricing tier found for {quantity} units of item {item_id}.")
-        price_per_unit = 0.00
-        selling_price = 0.00
-        total_sale = quantity * selling_price
-        overridden_flag = 1 if override_total is not None else 0
-        cost = 0.0
-        profit = 0.0
-    else:
-        price_per_unit = tier['price_per_unit']
-        selling_price = override_total if override_total is not None else price_per_unit
-        total_sale = quantity * selling_price
-        overridden_flag = 1 if override_total is not None else 0
-        cost = 0.0
-        profit = 0.0
-
-    # Deduct stock across fridges
-    qty_to_deduct = quantity
-    deduction_log = []
-    for r in rows:
-        if qty_to_deduct <= 0:
-            break
-        available = r['quantity']
-        deduct = min(available, qty_to_deduct)
-        new_qty = available - deduct
-        cursor.execute("UPDATE items SET quantity=? WHERE item_id=?", (new_qty, r['item_id']))
-        qty_to_deduct -= deduct
-        deduction_log.append(f"Fridge {r['fridge_no']}: deducted {deduct}, new qty={new_qty}")
-
-    # Insert into sales
-    cursor.execute("""
-        INSERT INTO sales 
-        (item_id, item_name, quantity, selling_price, total_sale, cost, profit, date, customer_id, overridden) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, DATE('now'), ?, ?)
-    """, (item_id, item_name, quantity, selling_price, total_sale, cost, profit, customer_id, overridden_flag))
-
-    # Insert into audit log
-    cursor.execute("""
-        INSERT INTO audit_log 
-        (item_name, category, action, quantity, unit_cost, selling_price, user, timestamp) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, DATETIME('now'))
-    """, (item_name, category, "Sale", quantity, cost, selling_price, user))
-
-    conn.commit()
-    conn.close()
-
-    return f"Sale recorded. Deduction details:\n" + "\n".join(deduction_log)
-
-# ---------------- Excel/CSV import file for Stock Add/Update ----------------
-def import_items_and_add_or_insert():
-    # Prompt user for file path
-    file_path = input("Please enter the full path to your Excel or CSV file: ").strip()
-
-    # Determine file type and read accordingly
-    file_ext = os.path.splitext(file_path)[1].lower()
-    if file_ext == '.csv':
-        df = pd.read_csv(file_path)
-    elif file_ext == '.xlsx':
-        df = pd.read_excel(file_path, engine='openpyxl')
-    elif file_ext == '.xls':
-        df = pd.read_excel(file_path, engine='xlrd')
-    else:
-        raise ValueError("Unsupported file format. Please upload a CSV or Excel file.")
-
-    # Connect to the database
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # Process each item in the file
-    for _, row in df.iterrows():
-        item = row['item']
-        category = row['category']
-        #unit_cost = row['unit_cost']
-        #selling_price = row['selling_price']
-        quantity = row['quantity']
-
-        # Check if item exists
-        cursor.execute("SELECT stock_quantity FROM items WHERE item_id = ?", (item_id,))
-        result = cursor.fetchone()
-
-        if result:
-            # Item exists, update stock quantity
-            current_quantity = result[0]
-            new_quantity = current_quantity + quantity
-            cursor.execute("UPDATE items SET stock_quantity = ? WHERE item_id = ?", (new_quantity, item_id))
-        else:
-            # Item does not exist, insert new item
-            cursor.execute("""
-                INSERT INTO items (item_id, category, quantity)
-                VALUES (?, ?, ?, ?, ?)
-            """, (item_id, category, quantity))
-
-    # Commit changes and close connection
-    conn.commit()
-    conn.close()
-    print("Items updated or inserted successfully.")
-
-# ------------ Update Pricing Tiers manually -----
-def update_pricing_tiers_ui():
-    conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-
-    # Step 1: Select item
-    cursor.execute("SELECT item_id, item_name FROM items")
-    items = cursor.fetchall()
-
-    # Build dictionary with combined display string
-    item_dict = {f"{iid} - {name}": iid for iid, name in items}
-    #item_dict = {name: iid for iid, name in items}
-
-    st.subheader("🔧 Update Pricing Tiers")
-    selected_item = st.selectbox("Select Item", list(item_dict.keys()))
-
-    if selected_item:
-        item_id = item_dict[selected_item]   # retrieve the actual item_id
-        st.write(f"Selected Item ID: {item_id}")
-
-        # Step 2: Show existing tiers
-        cursor.execute("SELECT id, min_qty, max_qty, price_per_unit, label FROM pricing_tiers WHERE item_id=?", (item_id,))
-        tiers = cursor.fetchall()
-
-        if tiers:
-            st.write("Existing Pricing Tiers:")
-            for tier in tiers:
-                tier_id, min_qty, max_qty, price_per_unit, label = tier
-                with st.expander(f"Tier {tier_id} ({label})"):
-                    new_min = st.number_input("Min Qty", value=min_qty, key=f"min_{tier_id}")
-                    new_max = st.number_input("Max Qty (0 = no limit)", value=max_qty if max_qty is not None else 0, key=f"max_{tier_id}")
-                    new_price = st.number_input("Price per Unit", value=price_per_unit, format="%,.2f", key=f"price_{tier_id}")
-                    new_label = st.text_input("Label", value=label, key=f"label_{tier_id}")
-
-                    if st.button(f"Update Tier {tier_id}", key=f"update_{tier_id}"):
-                        cursor.execute("""
-                            UPDATE pricing_tiers
-                            SET min_qty=?, max_qty=?, price_per_unit=?, label=?
-                            WHERE id=?
-                        """, (new_min, None if new_max == 0 else new_max, new_price, new_label, tier_id))
-                        conn.commit()
-                        st.success(f"Tier {tier_id} updated successfully!")
-
-        else:
-            st.info("No pricing tiers found for this item.")
-
-    conn.close()
-
-# ----------------- Manage Pricing Tiers -------------
+# ----------------- Manage Pricing Tiers -----------------
 def manage_pricing_tiers():
     st.title("Manage Pricing Tiers")
 
@@ -443,22 +87,17 @@ def manage_pricing_tiers():
     )
     item_id = int(item_label.split(" - ")[0])
     item_name = item_label.split(" - ")[1]
-    
-    # Show existing tiers
-    conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pricing_tiers WHERE item_id=? ORDER BY min_qty", (item_id,))
-    tiers = cursor.fetchall()
-    conn.close()
 
-    if tiers:
+    # Show existing tiers
+    from db_supabase import supabase
+    res = supabase.table("pricing_tiers").select("*").eq("item_id", item_id).order("min_qty").execute()
+    tiers = pd.DataFrame(res.data)
+
+    if not tiers.empty:
         st.subheader("Existing Pricing Tiers")
-        tiers_df = pd.DataFrame(tiers, columns=tiers[0].keys())
-        # Format nicely
-        tiers_df["max_qty"] = tiers_df["max_qty"].fillna("∞")
-        tiers_df["price_per_unit"] = tiers_df["price_per_unit"].map(lambda x: f"{x:.2f}")
-        st.dataframe(tiers_df, width='stretch')
+        tiers["max_qty"] = tiers["max_qty"].fillna("∞")
+        tiers["price_per_unit"] = tiers["price_per_unit"].map(lambda x: f"{x:.2f}")
+        st.dataframe(tiers, width='stretch')
     else:
         st.info("No pricing tiers defined for this item yet.")
 
@@ -472,294 +111,81 @@ def manage_pricing_tiers():
         label = st.text_input("Tier Label (optional)", value=item_name)
 
         if st.button("Save Tier"):
-            conn = get_connection()
-            cursor = conn.cursor()
-            if validate_if_exist(item_id, min_qty, max_qty):   # if existing, means it's an update
-                if max_qty == 0 or max_qty is None:
-                    cursor.execute(
-                        "UPDATE pricing_tiers SET price_per_unit=?, label=? WHERE item_id=? AND min_qty=? AND max_qty IS NULL",
-                        (price_per_unit, label.strip().upper(), item_id, min_qty)
+            # Check if tier exists
+            if max_qty == 0:
+                existing = (
+                    supabase.table("pricing_tiers")
+                    .select("*")
+                    .eq("item_id", item_id)
+                    .eq("min_qty", min_qty)
+                    .is_("max_qty", None)   # ✅ use .is_ for NULL
+                    .execute()
+                )
+            else:
+                existing = (
+                    supabase.table("pricing_tiers")
+                    .select("*")
+                    .eq("item_id", item_id)
+                    .eq("min_qty", min_qty)
+                    .eq("max_qty", max_qty)
+                    .execute()
+                )
+
+            if existing.data:
+                # Update
+                if max_qty == 0:
+                    (
+                        supabase.table("pricing_tiers")
+                        .update({
+                            "price_per_unit": price_per_unit,
+                            "label": label.strip().upper()
+                        })
+                        .eq("item_id", item_id)
+                        .eq("min_qty", min_qty)
+                        .is_("max_qty", None)
+                        .execute()
                     )
                 else:
-                    cursor.execute(
-                        "UPDATE pricing_tiers SET price_per_unit=?, label=? WHERE item_id=? AND min_qty=? AND max_qty=?",
-                        (price_per_unit, label.strip().upper(), item_id, min_qty, max_qty)
+                    (
+                        supabase.table("pricing_tiers")
+                        .update({
+                            "price_per_unit": price_per_unit,
+                            "label": label.strip().upper()
+                        })
+                        .eq("item_id", item_id)
+                        .eq("min_qty", min_qty)
+                        .eq("max_qty", max_qty)
+                        .execute()
                     )
-                conn.commit()
-                conn.close()
-                st.success(f"Updated existing pricing tier for {item_id}.")
+
+                st.success(f"Updated existing pricing tier for {item_name}.")
                 st.rerun()
             else:
-                cursor.execute(
-                    "INSERT INTO pricing_tiers (item_id, min_qty, max_qty, price_per_unit, label) VALUES (?, ?, ?, ?, ?)",
-                    (item_id, min_qty, None if max_qty == 0 else max_qty, price_per_unit, label.strip().upper())
-                )               
-                conn.commit()
-                conn.close()
+                # Insert
+                supabase.table("pricing_tiers").insert({
+                    "item_id": item_id,
+                    "min_qty": min_qty,
+                    "max_qty": None if max_qty == 0 else max_qty,  # ✅ None becomes SQL NULL
+                    "price_per_unit": price_per_unit,
+                    "label": label.strip().upper()
+                }).execute()
                 st.success("Added new Pricing tier successfully!")
                 st.rerun()
 
-
     # ✅ Collapsible Delete section
-    if tiers:
+    if not tiers.empty:
         with st.expander("🗑️ Delete a Tier", expanded=False):
             st.subheader("Delete a Tier")
-            tier_to_delete = "Select Tier to Delete" 
-            # tier_ids = [f"{t['id']} (min {t['min_qty']}, max {t['max_qty'] or '∞'})" for t in tiers]
             tier_ids = ["Select Tier to Delete"] + [
-                f"{t['id']} (min {t['min_qty']}, max {t['max_qty'] or '∞'})" for t in tiers
+                f"{t['id']} (min {t['min_qty']}, max {t['max_qty'] if t['max_qty'] is not None else '∞'})"
+                for _, t in tiers.iterrows()
             ]
             tier_to_delete = st.selectbox("Select Tier to Delete", tier_ids)
-            if st.button("Delete Tier"):
+            if st.button("Delete Tier") and tier_to_delete != "Select Tier to Delete":
                 tier_id = int(tier_to_delete.split()[0])
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM pricing_tiers WHERE id=?", (tier_id,))
-                conn.commit()
-                conn.close()
+                supabase.table("pricing_tiers").delete().eq("id", tier_id).execute()
                 st.success("Tier deleted successfully!")
                 st.rerun()
-
-# -------------- Validate no overlap on tiers -----------------
-def validate_if_exist(item_id, min_qty, max_qty):
-    """
-    Returns True if the proposed [min_qty, max_qty] does NOT overlap
-    with any existing tier for the item. Treats None as infinity.
-    """
-    conn = get_connection()
-    cur = conn.cursor()
-    if max_qty == 0 or max_qty is None:
-        cur.execute("SELECT id, min_qty, max_qty FROM pricing_tiers WHERE item_id=? and min_qty=? AND max_qty IS NULL", (item_id, min_qty))
-    else:
-        cur.execute("SELECT id, min_qty, max_qty FROM pricing_tiers WHERE item_id=? and min_qty=? and max_qty=?", (item_id, min_qty, max_qty))
-    rows = cur.fetchall()
-    if rows:
-        conn.close()
-        return True
-    else:
-        conn.close()
-        return False
-
-# --------------- Validate if customer exists --------------
-def validate_if_customer_exist(name):
-    """
-    Docstring for validate_if_customer_exist
-    
-    :param name: Description
-    """
-
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM CUSTOMERS WHERE name=?", (name.upper(),))
-    rows = cur.fetchall()
-    if rows:
-        conn.close()
-        return True
-    else:
-        conn.close()
-        return False
-
-# --------------- Generate Purchase Order ----------------
-def generate_po_pdf(order_date, customer_id, pickup_date):
-    conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-
-    # --- Generate PO Number ---
-    cursor.execute("CREATE TABLE IF NOT EXISTS po_sequence (date TEXT, seq INTEGER)")
-    cursor.execute("SELECT seq FROM po_sequence WHERE date=?", (order_date,))
-    row = cursor.fetchone()
-    if row:
-        seq = row['seq'] + 1
-        cursor.execute("UPDATE po_sequence SET seq=? WHERE date=?", (seq, order_date))
-    else:
-        seq = 1
-        cursor.execute("INSERT INTO po_sequence (date, seq) VALUES (?, ?)", (order_date, seq))
-    conn.commit()
-    po_number = f"PO-{order_date.replace('-', '')}-{seq:03d}"
-
-    # --- Vendor Info ---
-    vendor = {
-        "name": "KPrime Supplies",
-        "address": "Blk 3 Lot 5 West Wing Villas, North Belton QC",
-        "phone": "+63 995 744 9953",
-        "email": "kprimefoodinc@gmail.com"
-    }
-
-    # --- Buyer Info ---
-    cursor.execute("SELECT * FROM customers WHERE id=?", (customer_id,))
-    customer = cursor.fetchone()
-    buyer = {
-        "name": customer['name'],
-        "address": customer['address'],
-        "phone": customer['phone'],
-        "email": customer['email']
-    }
-    safe_name = buyer['name'].replace(" ", "_").replace("/", "_")
-    filename = f"PO_{order_date.replace('-', '')}_{safe_name}.pdf"
-
-    # --- Order Details ---
-    sales_df = pd.read_sql_query(
-        "SELECT item_id, item_name, SUM(quantity) as total_qty, selling_price "
-        "FROM sales WHERE date=? AND customer_id=? GROUP BY item_name, selling_price",
-        conn,
-        params=(order_date, customer_id)
-    )
-    conn.close()
-
-    # --- Build PDF ---
-    doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=40)
-    styles = getSampleStyleSheet()
-    elements = []
-
-    # Header
-    elements.append(Paragraph("PURCHASE ORDER (PO)", styles['Title']))
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph(f"PO Number: {po_number}", styles['Normal']))
-    elements.append(Paragraph(f"Date: {datetime.strptime(order_date, '%Y-%m-%d').strftime('%d %b %Y')}", styles['Normal']))
-    elements.append(Spacer(1, 12))
-
-    # Vendor
-    elements.append(Paragraph("<b>Vendor/Supplier:</b>", styles['Heading2']))
-    elements.append(Paragraph(f"{vendor['name']}", styles['Normal']))
-    elements.append(Paragraph(f"{vendor['address']}", styles['Normal']))
-    elements.append(Paragraph(f"Tel: {vendor['phone']}", styles['Normal']))
-    elements.append(Paragraph(f"Email: {vendor['email']}", styles['Normal']))
-    elements.append(Spacer(1, 12))
-
-    # Buyer
-    elements.append(Paragraph("<b>Buyer:</b>", styles['Heading2']))
-    elements.append(Paragraph(f"{buyer['name']}", styles['Normal']))
-    elements.append(Paragraph(f"{buyer['address']}", styles['Normal']))
-    elements.append(Paragraph(f"Tel: {buyer['phone']}", styles['Normal']))
-    elements.append(Paragraph(f"Email: {buyer['email']}", styles['Normal']))
-    elements.append(Spacer(1, 12))
-
-    # Order Details Table
-    data = [["Item No.", "Description", "Quantity", "Unit Price (PHP)", "Total (PHP)"]]
-    subtotal = 0
-    for idx, row in sales_df.iterrows():
-        total = row['total_qty'] * row['selling_price']
-        subtotal += total
-        data.append([
-            idx+1,
-            row['item_name'],
-            row['total_qty'],
-            f"{row['selling_price']:,.2f}",
-            f"{total:,.2f}"
-        ])
-
-    table = Table(data, colWidths=[50, 200, 60, 100, 100], hAlign='LEFT')
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.grey),
-        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
-        ('ALIGN',(2,1),(2,-1),'RIGHT'),   # Quantity column right aligned
-        ('ALIGN',(3,1),(4,-1),'RIGHT'),   # Unit Price and Total right aligned
-        ('GRID', (0,0), (-1,-1), 1, colors.black),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold')
-    ]))
-    elements.append(table)
-    elements.append(Spacer(1, 12))
-
-    # Totals
-    elements.append(Paragraph(f"Subtotal: PHP {subtotal:,.2f}", styles['Normal']))
-    elements.append(Paragraph("GST: PHP 0.00 (No GST)", styles['Normal']))
-    elements.append(Paragraph(f"Total Amount: PHP {subtotal:,.2f}", styles['Normal']))
-    elements.append(Spacer(1, 12))
-
-    # Pickup Date
-    elements.append(Paragraph(f"Pickup Date: {pickup_date}", styles['Normal']))
-    elements.append(Spacer(1, 32))
-    elements.append(Paragraph("Authorized By:", styles['Normal']))
-    elements.append(Paragraph("(Signature & Name)", styles['Normal']))
-
-    # Build PDF
-    doc.build(elements)
-    return filename
-
-
-# ---------------- PDF Generation for SOA ----------------
-
-# Blk 3 Lot 5 West Wing Villas, North Belton QC
-# -*- coding: utf-8 -*-
-
-def generate_soa_pdf(customer_name, customer_id, start_date, end_date, soa_df):
-
-    # Ensure start_date and end_date are strings
-    if not isinstance(start_date, str):
-        start_date = start_date.strftime("%Y-%m-%d")
-    if not isinstance(end_date, str):
-        end_date = end_date.strftime("%Y-%m-%d")
-
-    # --- File name ---
-    safe_name = customer_name.replace(" ", "_").replace("/", "_")
-    filename = f"SOA_{start_date.replace('-', '')}_{end_date.replace('-', '')}_{safe_name}.pdf"
-
-    # --- Build PDF ---
-    doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=40)
-    styles = getSampleStyleSheet()
-    elements = []
-
-    # Header
-    elements.append(Paragraph("STATEMENT OF ACCOUNT (SOA)", styles['Title']))
-    elements.append(Paragraph(f"Customer: {customer_name} (ID: {customer_id})", styles['Normal']))
-    elements.append(Paragraph(f"Period: {start_date} to {end_date}", styles['Normal']))
-    elements.append(Spacer(1, 12))
-
-    # Table Header
-    data = [["Date", "Item", "Quantity", "Unit Price (PHP)", "Total (PHP)"]]
-
-    # Table Rows
-    total_amount = 0
-    total_qty = 0
-    for idx, row in soa_df.iterrows():
-        qty = row['quantity']
-        price = row['selling_price']
-        total = row['total_sale']
-        total_amount += total
-        total_qty += qty
-
-        data.append([
-            str(row['date']),
-            str(row['item_name']),
-            qty,
-            f"{price:,.2f}",
-            f"{total:,.2f}"
-        ])
-
-    # Create Table
-    table = Table(data, colWidths=[80, 180, 50, 90, 90], hAlign='LEFT')
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.grey),
-        ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
-        ('ALIGN',(2,1),(2,-1),'RIGHT'),   # Quantity column right aligned
-        ('ALIGN',(3,1),(4,-1),'RIGHT'),   # Unit Price and Total right aligned
-        ('GRID', (0,0), (-1,-1), 1, colors.black),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold')
-    ]))
-    elements.append(table)
-    elements.append(Spacer(1, 12))
-
-    # Summary
-    transaction_count = len(soa_df)
-    elements.append(Paragraph(f"Transactions: {transaction_count}", styles['Normal']))
-    elements.append(Paragraph(f"Total Quantity: {total_qty}", styles['Normal']))
-    elements.append(Paragraph(f"Total Amount: PHP {total_amount:,.2f}", styles['Normal']))
-    elements.append(Spacer(1, 24))
-
-    # Footer
-    elements.append(Paragraph("Thank you for choosing Steak Haven - Premium Quality Meat", styles['Normal']))
-
-    # Build PDF
-    doc.build(elements)
-    return filename
-
-# --- Add Price History Table Creation ---
-def create_price_history_table2():
-    conn = get_connection()
-    conn.execute("CREATE TABLE IF NOT EXISTS price_history (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER, old_quantity INTEGER, new_price_quantity INTEGER, old_unit_cost REAL, old_selling_price REAL, new_unit_cost REAL, new_selling_price REAL, changed_by TEXT, timestamp TEXT)")
-    conn.commit()
-    conn.close()
 
 # ---------------- Upload Tiered Pricing ----------------
 def upload_tiered_pricing(uploaded_file):
@@ -771,60 +197,71 @@ def upload_tiered_pricing(uploaded_file):
     file_ext = os.path.splitext(uploaded_file.name)[1].lower()
     if file_ext == '.csv':
         df = pd.read_csv(uploaded_file)
-    elif file_ext == '.xlsx':
-        df = pd.read_excel(uploaded_file, engine='openpyxl')
-    elif file_ext == '.xls':
-        df = pd.read_excel(uploaded_file, engine='xlrd')
+    elif file_ext in ['.xlsx', '.xls']:
+        df = pd.read_excel(uploaded_file, engine='openpyxl' if file_ext == '.xlsx' else 'xlrd')
     else:
         raise ValueError("Unsupported file format. Please upload a CSV or Excel file.")
 
-    # Connect to the database
-    conn = get_connection()
-    cursor = conn.cursor()
+    from db_supabase import supabase
+
+    skipped_rows = []
 
     # Process each pricing tier in the file
     for _, row in df.iterrows():
-        item_id = row['item_id']
-        min_qty = row['min_qty']
-        max_qty = row['max_qty'] if not pd.isna(row['max_qty']) else None
-        price_per_unit = row['price_per_unit']
-        label = row['label']
+        item_id = int(row['item_id'])
+        min_qty = int(row['min_qty'])
+        max_qty = None if pd.isna(row['max_qty']) else int(row['max_qty'])
+        price_per_unit = float(row['price_per_unit'])
+        label = str(row['label']).strip().upper()
 
-        # Check if record exists
-        cursor.execute("""
-            SELECT id FROM pricing_tiers
-            WHERE item_id = ? AND min_qty = ? AND (max_qty IS ? OR max_qty = ?) AND label = ?
-        """, (item_id, min_qty, max_qty, max_qty, label))
-        existing = cursor.fetchone()
+        # ✅ Check if item exists in items table
+        item_check = supabase.table("items").select("item_id").eq("item_id", item_id).execute()
+        if not item_check.data:
+            skipped_rows.append(item_id)
+            continue  # Skip this row
 
-        if existing:
+        # Check if pricing tier exists
+        if max_qty is None:
+            existing = (
+                supabase.table("pricing_tiers")
+                .select("id")
+                .eq("item_id", item_id)
+                .eq("min_qty", min_qty)
+                .is_("max_qty", None)
+                .eq("label", label)
+                .execute()
+            )
+        else:
+            existing = (
+                supabase.table("pricing_tiers")
+                .select("id")
+                .eq("item_id", item_id)
+                .eq("min_qty", min_qty)
+                .eq("max_qty", max_qty)
+                .eq("label", label)
+                .execute()
+            )
+
+        if existing.data:
             # Update price_per_unit if record exists
-            cursor.execute("""
-                UPDATE pricing_tiers
-                SET price_per_unit = ?
-                WHERE id = ?
-            """, (price_per_unit, existing[0]))
+            tier_id = existing.data[0]["id"]
+            supabase.table("pricing_tiers").update({
+                "price_per_unit": price_per_unit
+            }).eq("id", tier_id).execute()
         else:
             # Insert new record if not found
-            cursor.execute("""
-                INSERT INTO pricing_tiers (item_id, min_qty, max_qty, price_per_unit, label)
-                VALUES (?, ?, ?, ?, ?)
-            """, (item_id, min_qty, max_qty, price_per_unit, label))
+            supabase.table("pricing_tiers").insert({
+                "item_id": item_id,
+                "min_qty": min_qty,
+                "max_qty": max_qty,
+                "price_per_unit": price_per_unit,
+                "label": label
+            }).execute()
 
-    # Commit changes and close connection
-    conn.commit()
-    conn.close()
-    st.success("Pricing Tiers updated or inserted successfully!")
-
-# ---------------- CREATE TABLES ----------------
-create_tables()
-#create_price_history_table()
-
-# ---------------- LOGOUT FUNCTION ----------------
-def logout():
-    st.session_state.logged_in = False
-    st.session_state.menu = "Landing"
-    st.session_state.username = ""
+    if skipped_rows:
+        st.warning(f"Skipped rows with invalid item_id(s): {skipped_rows}")
+    else:
+        st.success("Pricing Tiers updated or inserted successfully!")
 
 # ---------------- LOGIN PAGE ----------------
 if not st.session_state.logged_in:
@@ -839,10 +276,7 @@ if not st.session_state.logged_in:
             st.session_state.logged_in = True
             st.session_state.menu = "Home"
             st.session_state.username = username
-            try:
-                st.rerun()
-            except AttributeError:
-                st.rerun()
+            st.rerun()
         else:
             st.error("Invalid credentials")
 
@@ -856,7 +290,6 @@ elif st.session_state.logged_in:
     stock_threshold = st.sidebar.number_input("Set Stock Alert Threshold", min_value=0, value=5)
 
     with st.sidebar:
-        # Main menu
         main_menu = option_menu(
             "Main Menu",
             ["Home", "Inventory", "Pricing", "Customer", "Reports"],
@@ -865,7 +298,6 @@ elif st.session_state.logged_in:
             default_index=0
         )
 
-        # Submenu depending on main menu
         if main_menu == "Home":
             menu = option_menu("Home", ["Home"], icons=["house"])
         elif main_menu == "Inventory":
@@ -901,8 +333,6 @@ elif st.session_state.logged_in:
     st.session_state.menu = menu
     st.write(f"Selected: {main_menu} → {menu}")
 
-## Aileen Added
-
     # ---------------- HOME ----------------
     if menu == "Home":
         st.title("Dashboard")
@@ -911,88 +341,85 @@ elif st.session_state.logged_in:
         if not items_df.empty:
             st.subheader("Inventory Summary")
             st.metric("Total Items", len(items_df))
-            #st.metric("Total Stock Value", f"${(items_df['quantity'] * items_df['unit_cost']).sum():,.2f}")
             fig = px.bar(items_df, x='category', y='quantity', color='category', title="Stock by Category")
             st.plotly_chart(fig)
         if not sales_df.empty:
             st.subheader("Sales Summary")
-            #st.metric("Total Sales", f"${sales_df['total_sale'].sum():,.2f}")
-            #st.metric("Total Profit", f"${sales_df['profit'].sum():,.2f}")
             fig2 = px.line(sales_df, x='date', y='profit', title="Profit Trend Over Time")
             st.plotly_chart(fig2)
 
-    # ---------------- ADD/UPDATE STOCK ----------------
+    # ---------------- VIEW INVENTORY ----------------
+    elif menu == "View Inventory":
+        st.title("Current Inventory")
+        data = view_items()
+        if data.empty:
+            st.warning("No items found.")
+        else:
+            paged_df, total_pages = paginate_dataframe(data, page_size=100)
+            st.write(f"Showing {len(paged_df)} rows (Page size: 100)")
+            st.dataframe(paged_df[['item_id','item_name','category','quantity','fridge_no']])
+            csv_inventory = data.to_csv(index=False)
+            st.download_button("Download Inventory CSV", data=csv_inventory, file_name="inventory.csv", mime="text/csv")
+
+    # ---------------- MANAGE STOCK ----------------
     elif menu == "Manage Stock":
         st.title("Manage Stock")
-
         items_df = view_items()
         if items_df.empty:
             st.warning("No items found.")
         else:
-            # Show current inventory list
             st.subheader("Current Inventory")
             st.dataframe(items_df[['item_id','item_name','category','quantity','fridge_no']])
 
-        # --- Collapsible section: Add/Update Stock ---
         with st.expander("➕ Add or Update Stock", expanded=False):
             existing_categories = sorted(items_df['category'].dropna().unique()) if not items_df.empty else []
             category_options = ["Add New"] + existing_categories
-
-            # Build item options with "<item_id> - <item_name>"
             if not items_df.empty:
                 item_options = ["Add New"] + [f"{row['item_id']} - {row['item_name']}" for _, row in items_df.iterrows()]
             else:
                 item_options = ["Add New"]
 
             selected_item = st.selectbox("Select Item", item_options)
-
             current_stock = None
+
             if selected_item != "Add New":
                 selected_item_id = int(selected_item.split(" - ")[0])
                 selected_item_name = selected_item.split(" - ")[1]
-
                 item_rows = items_df[items_df['item_name'] == selected_item_name]
                 if not item_rows.empty:
                     st.session_state.selected_category = item_rows.iloc[0]['category']
                     category_name = st.session_state.selected_category
-
                     current_stock = item_rows['quantity'].sum()
                     st.info(f"Stock Currently On Hand: {current_stock}")
-
                     st.write("Per-Fridge Breakdown:")
                     st.dataframe(item_rows[['fridge_no','quantity']])
                 else:
                     st.warning(f"No records found for item '{selected_item}'.")
-                    current_stock = None
+                item_id = selected_item_id
+                item_name = selected_item_name
             else:
                 selected_category = st.selectbox("Select Category", category_options)
                 category_name = selected_category
-                if selected_item == "Add New" and selected_category == "Add New":
+                if selected_category == "Add New":
                     category_name = st.text_input("Enter New Category Name")
+                item_name = st.text_input("Enter New Item Name", value=st.session_state.item_name)
+                item_id = None  # ✅ Important: no bigint error
 
-            item_name = (
-                st.text_input("Enter New Item Name", value=st.session_state.item_name)
-                if selected_item == "Add New"
-                else selected_item.split(" - ")[1]
-            )
-            item_id = selected_item.split(" - ")[0]
             quantity = st.number_input("Quantity to Add", min_value=1, value=st.session_state.quantity)
             fridge_no = st.text_input("Fridge No", value=st.session_state.fridge_no)
 
             if st.button("Save"):
-                if item_id and category_name:
+                if item_name and category_name:
                     add_or_update_item(item_id, item_name.strip().upper(), category_name.strip().upper(), quantity, fridge_no, st.session_state.username)
                     st.success(f"Item '{item_name}' in category '{category_name}' updated successfully!")
                     st.rerun()
                 else:
                     st.error("Please provide valid item and category names.")
 
-        # --- Collapsible section: Delete Item ---
         with st.expander("🗑️ Delete Item", expanded=False):
             if items_df.empty:
                 st.warning("No items to delete.")
             else:
-                selected_label = "Select Item to Delete"
                 items_df['label'] = items_df.apply(lambda row: f"{row['item_id']} - {row['category']} - {row['item_name']}", axis=1)
                 selected_label = st.selectbox("Select Item to Delete", items_df['label'])
                 item_id = int(selected_label.split(" - ")[0])
@@ -1001,228 +428,63 @@ elif st.session_state.logged_in:
                     st.success(f"Item with ID {item_id} deleted successfully!")
                     st.rerun()
 
-
-
-    elif menu == "Add/Update Stock":
-        st.title("Add or Update Stock")
-        items_df = view_items()
-        existing_categories = sorted(items_df['category'].dropna().unique()) if not items_df.empty else []
-
-        # Build item options with "<item_id> - <item_name>"
-        if not items_df.empty:
-            item_options = ["Add New"] + [
-                f"{row['item_id']} - {row['item_name']}" for _, row in items_df.iterrows()
-            ]
-        else:
-            item_options = ["Add New"]
-
-        category_options = ["Add New"] + existing_categories
-
-        # Session state initialization
-        if 'item_name' not in st.session_state: st.session_state.item_name = ""
-        if 'category_name' not in st.session_state: st.session_state.category_name = ""
-        if 'quantity' not in st.session_state: st.session_state.quantity = 1
-        if 'fridge_no' not in st.session_state: st.session_state.fridge_no = ""
-        if 'selected_item' not in st.session_state: st.session_state.selected_item = "Add New"
-        if 'selected_category' not in st.session_state: st.session_state.selected_category = "Add New"
-        if 'show_next_action' not in st.session_state: st.session_state.show_next_action = False
-
-        selected_item = st.selectbox(
-            "Select Item",
-            item_options,
-            index=item_options.index(st.session_state.selected_item) if st.session_state.selected_item in item_options else 0
-        )
-
-        current_stock = None
-        if selected_item != "Add New":
-            # Extract item_id back from "<item_id> - <item_name>"
-            selected_item_id = int(selected_item.split(" - ")[0])
-            selected_item_name = selected_item.split(" - ")[1]
-
-            # Get all rows for this item_id (could be multiple fridges)
-            item_rows = items_df[items_df['item_name'] == selected_item_name]
-
-            if not item_rows.empty:
-                # Category is the same across rows
-                st.session_state.selected_category = item_rows.iloc[0]['category']
-                st.markdown(
-                    f"<div style='background-color:#003366;color:white;padding:8px;border-radius:4px;'>Category: {st.session_state.selected_category}</div>",
-                    unsafe_allow_html=True
-                )
-                category_name = st.session_state.selected_category
-
-                num_records = len(item_rows)
-                st.write(f"Number of records in item_rows: {num_records}")
-
-                # ✅ Sum all quantities across fridge_no
-                current_stock = item_rows['quantity'].sum()
-
-                # Optional: show per-fridge breakdown
-                st.write("Per-Fridge Breakdown:")
-                st.dataframe(item_rows[['fridge_no', 'quantity']])
-            else:
-                st.warning(f"No records found for item '{selected_item}'.")
-                current_stock = None
-
-        if current_stock is not None:
-            st.info(f"Stock Currently On Hand: {current_stock}")
-        else:
-            selected_category = st.selectbox(
-                "Select Category",
-                category_options,
-                index=category_options.index(st.session_state.selected_category) if st.session_state.selected_category in category_options else 0
-            )
-            category_name = selected_category
-            if selected_item == "Add New" and selected_category == "Add New":
-                category_name = st.text_input("Enter New Category Name")
-        
-        item_name = (
-            st.text_input("Enter New Item Name", value=st.session_state.item_name)
-            if selected_item == "Add New"
-            else selected_item.split(" - ")[1]  # extract item_name part
-        )
-        item_id = selected_item.split(" - ")[0]  # extract item_id part
-        quantity = st.number_input("Quantity to Add", min_value=1, value=st.session_state.quantity)
-        fridge_no = st.text_input("Fridge No", value=st.session_state.fridge_no)
-
-        if st.button("Save"):
-            if item_id and category_name:
-                #st.write(f"calling function - {item_id} and {quantity}")
-                add_or_update_item(item_id, item_name.strip().upper(), category_name.strip().upper(), quantity, fridge_no, st.session_state.username)
-                st.success(f"Item '{item_name}' in category '{category_name}' updated successfully!")
-                st.session_state.show_next_action = True
-            else:
-                st.error("Please provide valid item and category names.")
-
-    # ---------------- File Upload (Items) ----------------
+    # ---------------- FILE UPLOAD (ITEMS) ----------------
     elif menu == "File Upload (Items)":
         st.title("File Upload (Items)")
         uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"])
         if uploaded_file is not None:
-            # Read file based on extension
             file_ext = os.path.splitext(uploaded_file.name)[1].lower()
             if file_ext == ".csv":
                 df = pd.read_csv(uploaded_file)
             else:
                 df = pd.read_excel(uploaded_file)
-            
-            # Validate columns
             required_cols = ["item_name", "category", "quantity", "fridge_no"]
             if all(col in df.columns for col in required_cols):
-                conn = get_connection()
-                cursor = conn.cursor()
                 for _, row in df.iterrows():
                     add_or_update_item(None, row["item_name"].strip().upper(), row["category"].strip().upper(), row["quantity"], row["fridge_no"], st.session_state.username)
-                conn.commit()
-                conn.close()
                 st.success("Items updated or inserted successfully!")
             else:
                 st.error(f"Missing required columns: {required_cols}")
 
-    # ---------------- UPLOAD PRICING ----------------
-    elif menu == "File Upload (Pricing)":
-        st.title("File Upload (Pricing)")
-        uploaded_file = st.file_uploader("Upload Pricing CSV or Excel file", type=["csv", "xlsx", "xls"])
-        if uploaded_file:
-            upload_tiered_pricing(uploaded_file)
-            
-    # ---------------- View Tiered Pricing ------------------
+    # ---------------- DELETE ALL INVENTORY ----------------
+    elif menu == "Delete All Inventory":
+        st.title("Delete All Inventory")
+        st.warning("This action will delete ALL inventory items permanently.")
+        confirm = st.text_input("Type 'DELETE' to confirm")
+        if st.button("Delete All Inventory"):
+            if confirm == "DELETE":
+                delete_all_inventory()
+                st.success("All inventory items have been deleted.")
+            else:
+                st.error("Confirmation text does not match. Inventory not deleted.")
+
+
+    # ---------------- VIEW PRICING TIERS ----------------
     elif menu == "View Pricing Tiers":
         st.title("View Pricing Tiers")
-        # show the tiered pricing
         data = view_pricing()
         if data.empty:
             st.warning("No pricing found.")
         else:
             paged_df, total_pages = paginate_dataframe(data, page_size=100)
             st.write(f"Showing {len(paged_df)} rows (Page size: 100)")
-
-
-            st.dataframe(
-                paged_df.style
-                .format({"price_per_unit": "{:,.2f}"}),
-                width="stretch"
-                )
+            st.dataframe(paged_df.style.format({"price_per_unit": "{:,.2f}"}), width="stretch")
             csv_inventory = data.to_csv(index=False)
-            st.download_button("Download Pricing Tiers CSV", data=csv_inventory, file_name="Pricing tiers.csv", mime="text/csv")               
+            st.download_button("Download Pricing Tiers CSV", data=csv_inventory, file_name="Pricing_tiers.csv", mime="text/csv")
 
-    # ---------------- Update Pricing Manually ---------
-    elif menu == "Update Pricing Manually":
-        update_pricing_tiers_ui()
-        
-    # ---------------- Manage Pricing Tiers -----------
+    # ---------------- FILE UPLOAD (PRICING) ----------------
+    elif menu == "File Upload (Pricing)":
+        st.title("File Upload (Pricing)")
+        uploaded_file = st.file_uploader("Upload Pricing CSV or Excel file", type=["csv", "xlsx", "xls"])
+        if uploaded_file:
+            upload_tiered_pricing(uploaded_file)
+
+
+    # ---------------- MANAGE PRICING TIERS ----------------
     elif menu == "Manage Pricing Tiers":
+        #st.title("Manage Pricing Tiers")
+        #st.info("This section should allow adding/updating/deleting pricing tiers with Supabase calls.")
         manage_pricing_tiers()
-    # ---------------- VIEW INVENTORY ----------------
-    elif menu == "View Inventory":
-        st.title("Inventory Data")
-        data = view_items()
-        if data.empty:
-            st.warning("No items found.")
-        else:
-            # Toggle between views
-            view_mode = st.radio(
-                "Select View Mode",
-                ["Per-Fridge View", "Aggregated View"],
-                index=0
-            )
-
-            def highlight_low_stock(row):
-                return ['background-color: #CC0000' if row['quantity'] < stock_threshold else '' for _ in row]
-
-            if view_mode == "Per-Fridge View":
-                # ✅ Add fridge filter
-                fridge_options = sorted(data["fridge_no"].unique())
-                selected_fridge = st.selectbox("Filter by Fridge No", ["All"] + fridge_options)
-
-                if selected_fridge != "All":
-                    data = data[data["fridge_no"] == selected_fridge]
-
-                # ✅ Order by fridge_no
-                data = data.sort_values(by="fridge_no")
-
-                # Paginate after filtering & sorting
-                paged_df, total_pages = paginate_dataframe(data, page_size=100)
-                st.write(f"Showing {len(paged_df)} rows (Page size: 100)")
-
-                st.dataframe(
-                    paged_df.style
-                    .apply(highlight_low_stock, axis=1)
-                    .set_properties(subset=["item_id","quantity"], **{"text-align": "center"}),
-                    width='stretch'
-                )
-
-                # Download per-fridge CSV
-                csv_inventory = data.to_csv(index=False)
-                st.download_button(
-                    "Download Per-Fridge Inventory CSV",
-                    data=csv_inventory,
-                    file_name="inventory_per_fridge.csv",
-                    mime="text/csv"
-                )
-
-            else:  # Aggregated View
-                aggregated_df = (
-                    data.groupby(["item_name", "category"], as_index=False)
-                        .agg({"quantity": "sum"})
-                        .rename(columns={"quantity": "total_stock"})
-                )
-                st.write(f"Showing {len(aggregated_df)} aggregated rows")
-                st.dataframe(
-                    aggregated_df.style
-                    .format({"total_stock": "{:,.0f}"})
-                    .set_properties(subset=["total_stock"], **{"text-align": "left"}),
-                    width='stretch'
-                )
-
-                # Download aggregated CSV
-                csv_aggregated = aggregated_df.to_csv(index=False)
-                st.download_button(
-                    "Download Aggregated Inventory CSV",
-                    data=csv_aggregated,
-                    file_name="inventory_aggregated.csv",
-                    mime="text/csv"
-                )
 
     # ---------------- VIEW AUDIT LOG ----------------
     elif menu == "View Audit Log":
@@ -1244,143 +506,107 @@ elif st.session_state.logged_in:
             csv_audit = audit_df.to_csv(index=False)
             st.download_button("Download Audit Log CSV", data=csv_audit, file_name="audit_log.csv", mime="text/csv")
 
-    # ---------------- DELETE ITEM ----------------
-    elif menu == "Delete Item":
-        st.title("Delete Item")
-        data = view_items()
-        if data.empty:
-            st.warning("No items to delete.")
-        else:
-            data['label'] = data.apply(lambda row: f"{row['item_id']} - {row['category']} - {row['item_name']}", axis=1)
-            selected_label = st.selectbox("Select Item to Delete", data['label'])
-            item_id = int(selected_label.split(" - ")[0])
-            if st.button("Delete"):
-                delete_item(item_id, st.session_state.username)
-                st.success(f"Item with ID {item_id} deleted successfully!")
-                st.rerun()
-
-    # ---------------- DELETE ALL INVENTORY ----------------
-    elif menu == "Delete All Inventory":
-        st.title("Delete All Inventory")
-        if st.button("Confirm Delete All Inventory"):
-            conn = get_connection()
-            conn.execute('DELETE FROM items')
-            conn.commit()
-            conn.close()
-            st.success("All inventory and audit logs deleted successfully!")
-
-    # ---------------- DELETE ALL INVENTORY ----------------
-    elif menu == "Delete Pricing Tiers":
-        st.title("Delete All Pricing Tiers")
-        if st.button("Confirm Delete All Pricing Tiers"):
-            conn = get_connection()
-            conn.execute('DELETE FROM pricing_tiers')
-            conn.commit()
-            conn.close()
-            st.success("All Pricing Tiers deleted successfully!")
-
     # ---------------- ADD CUSTOMER ----------------
     elif menu == "Add Customer":
         st.title("Add New Customer")
         name = st.text_input("Customer Name")
         phone = st.text_input("Phone")
         email = st.text_input("Email")
-        # validate that email is in proper format
         if email and "@" not in email:
             st.error("Please enter a valid email address.")
         address = st.text_area("Address")
         if st.button("Save Customer"):
-            conn = get_connection()
-            conn.execute('INSERT INTO customers (name, phone, email, address) VALUES (?, ?, ?, ?)',
-                         (name.upper(), phone, email.upper(), address.upper()))
-            conn.commit()
-            conn.close()
+            from db_supabase import supabase
+            supabase.table("customers").insert({
+                "name": name.upper(),
+                "phone": phone,
+                "email": email.upper(),
+                "address": address.upper()
+            }).execute()
             st.success(f"Customer '{name}' added successfully!")
 
-    # ---------------- VIEW CUSTOMERS ----------------
+    # ---------------- MANAGE CUSTOMERS ----------------
     elif menu == "Manage Customers":
         st.title("Customer List")
-        data = view_customers()
-        if data.empty:
+        customers_df = view_customers()
+        if customers_df.empty:
             st.warning("No customers found.")
         else:
-            #paged_customers, total_pages = paginate_dataframe(data, page_size=20)
-            #st.write(f"Showing {len(paged_customers)} rows (Page size: 20)")
-            #st.dataframe(paged_customers)
-        # ---- maintain customers -----
+            st.subheader("Current Customers")
+            st.dataframe(customers_df[['id','name','phone','email','address']], width='stretch')
 
-            customer_label = st.selectbox(
-            "Select Customer",
-            data.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
-            )
-            customer_id = int(customer_label.split(" - ")[0])
-
-            # Show existing tiers
-            conn = get_connection()
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM customers WHERE id=?", (customer_id,))
-            customers = cursor.fetchall()
-            conn.close()
-
-            if customers:
-                st.subheader("Existing Customers")
-                customers_df = pd.DataFrame(customers, columns=customers[0].keys())
-                st.dataframe(customers_df, width='stretch')
+        with st.expander("➕ Add / Update Customers", expanded=False):
+            if not customers_df.empty:
+                customer_options = ["Add New"] + [f"{row['id']} - {row['name']}" for _, row in customers_df.iterrows()]
             else:
-                st.info("No customers defined yet.")
+                customer_options = ["Add New"]
 
-            st.markdown("---")
-
-            # ✅ Collapsible Add/Update section
-            with st.expander("➕ Add / Update Customers", expanded=False):
+            selected_customer = st.selectbox("Select Customer", customer_options)
+            if selected_customer != "Add New":
+                selected_customer_id = int(selected_customer.split(" - ")[0])
+                selected_customer_name = selected_customer.split(" - ")[1]
+                customer_rows = customers_df[customers_df['name'] == selected_customer_name]
+                if not customer_rows.empty:
+                    st.info("Existing customer details:")
+                    st.dataframe(customer_rows[['id','name','phone','email','address']])
+                else:
+                    st.warning(f"No records found for customer '{selected_customer_name}'.")
+                customer_id = selected_customer_id
+                name = st.text_input("Name", value=selected_customer_name)
+                phone = st.text_input("Contact No", value=customer_rows.iloc[0]['phone'] if not customer_rows.empty else "")
+                email = st.text_input("Email Address", value=customer_rows.iloc[0]['email'] if not customer_rows.empty else "")
+                address = st.text_input("Address", value=customer_rows.iloc[0]['address'] if not customer_rows.empty else "")
+            else:
+                customer_id = None
                 name = st.text_input("Name", value="")
                 phone = st.text_input("Contact No", value="")
                 email = st.text_input("Email Address", value="")
                 address = st.text_input("Address", value="")
 
-                if st.button("Save Customer"):
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    if validate_if_customer_exist(name):   # if existing, means it's an update
-                        cursor.execute(
-                            "UPDATE customers set phone=?, email=?, address=? where name=?",
-                            (phone.strip(), email.strip().upper(), address.strip().upper(), name.strip().upper())
-                        ) 
-                        st.write(f"{phone} {email} {address}")
-                        conn.commit()
-                        conn.close()
-                        st.success(f"Updated existing profile for {name}.")
-                        st.rerun()
-                    else:
-                        cursor.execute(
-                            "INSERT INTO customers (name, phone, email, address) VALUES (?, ?, ?, ?)",
-                            (name.strip().upper(), phone.strip(), email.strip().upper(), address.strip().upper())
-                        )                
-                        conn.commit()
-                        conn.close()
-                        st.success("Added new Customer successfully!")
-                        st.rerun()
+            if st.button("Save Customer"):
+                from db_supabase import supabase
+                if customer_id:  # Update existing
+                    supabase.table("customers").update({
+                        "name": name.strip().upper(),
+                        "phone": phone.strip(),
+                        "email": email.strip().upper(),
+                        "address": address.strip().upper()
+                    }).eq("id", customer_id).execute()
+                    st.success(f"Customer '{name}' updated successfully!")
+                else:  # Insert new (omit id, auto-generated)
+                    supabase.table("customers").insert({
+                        "name": name.strip().upper(),
+                        "phone": phone.strip(),
+                        "email": email.strip().upper(),
+                        "address": address.strip().upper()
+                    }).execute()
+                    st.success(f"Customer '{name}' added successfully!")
+                st.rerun()
 
+        with st.expander("🗑️ Delete a Customer", expanded=False):
+            if customers_df.empty:
+                st.warning("No customers to delete.")
+            else:
+                customers_df['label'] = customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
+                selected_label = st.selectbox("Select Customer to Delete", customers_df['label'])
+                customer_id = int(selected_label.split(" - ")[0])
+                if st.button("Delete Customer"):
+                    from db_supabase import supabase
+                    supabase.table("customers").delete().eq("id", customer_id).execute()
+                    st.success(f"Customer with ID {customer_id} deleted successfully!")
+                    st.rerun()
 
-            # ✅ Collapsible Delete section
-            if customers:
-                with st.expander("🗑️ Delete a Customer", expanded=False):
-                    st.subheader("Delete a Customer")
-                    customer_to_delete = "Select Customer to Delete" 
-                    customer_ids = ["Select Customer to Delete"] + [
-                        f"{t['id']} - {t['name']}" for t in customers
-                    ]
-                    customer_to_delete = st.selectbox("Select Customer to Delete", customer_ids)
-                    if st.button("Delete Customer"):
-                        customer_id = int(customer_to_delete.split()[0])
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("DELETE FROM customers WHERE id=?", (customer_id,))
-                        conn.commit()
-                        conn.close()
-                        st.success("Customer deleted successfully!")
-                        st.rerun()
+    # ---------------- DELETE ALL CUSTOMERS ----------------
+    elif menu == "Delete All Customers":
+        st.title("Delete All Customers")
+        st.warning("This action will delete ALL customers permanently.")
+        confirm = st.text_input("Type 'DELETE' to confirm")
+        if st.button("Delete All Customers"):
+            if confirm == "DELETE":
+                delete_all_customers()
+                st.success("All customers have been deleted.")
+            else:
+                st.error("Confirmation text does not match. Customers not deleted.")
 
     # ---------------- VIEW SALES FOR A CUSTOMER ----------------
     elif menu == "View Sale for a Customer":
@@ -1400,23 +626,17 @@ elif st.session_state.logged_in:
             else:
                 paged_sales, total_pages = paginate_dataframe(sales_df, page_size=20)
                 st.write(f"Showing {len(paged_sales)} rows (Page size: 20)")
-
-                # ✅ Format total_sale with 2 decimals              
-                styled_sales = (
-                    paged_sales.style
-                    .format({
-                        "total_sale": "{:,.2f}",
-                        "selling_price": "{:,.2f}",
-                        "cost": "{:,.2f}",
-                        "profit": "{:,.2f}"
-                    })
-                )
-
+                styled_sales = paged_sales.style.format({
+                    "total_sale": "{:,.2f}",
+                    "selling_price": "{:,.2f}",
+                    "cost": "{:,.2f}",
+                    "profit": "{:,.2f}"
+                })
                 st.dataframe(styled_sales, width='stretch')
                 csv_sales = sales_df.to_csv(index=False)
                 st.download_button("Download Sales CSV", data=csv_sales, file_name="sales_customer.csv", mime="text/csv")
-    
-    # ---------------- Generate PO for Customer based on Sales Date ----------------
+
+   # ---------------- GENERATE PURCHASE ORDER ----------------
     elif menu == "Generate Purchase Order":
         st.title("Generate Purchase Order (PO)")
         customers_df = view_customers()
@@ -1428,137 +648,134 @@ elif st.session_state.logged_in:
                 customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
             )
             customer_id = int(customer_label.split(" - ")[0])
-
-            # select order date from the list of customer orders
             sales_df = view_sales_by_customers(customer_id)
             if sales_df.empty:
                 st.warning("No sales records found for this customer.")
             else:
                 order_dates = sales_df['date'].unique()
                 order_date = st.selectbox("Select Order Date", order_dates)
-
-                # normalize order_date
                 if isinstance(order_date, date):
                     order_date_sql = order_date.strftime("%Y-%m-%d")
                 else:
                     order_date_sql = str(order_date)
-                    
+
                 pickup_date = st.date_input("Pickup Date")
-                # normalize pickup_date (st.date_input returns a date)
                 pickup_date_sql = pickup_date.strftime("%Y-%m-%d")
 
-                #order_date = datetime.strptime(order_date_str, "%Y-%m-%d").date()
+                if st.button("Generate PO"):
+                    from fpdf import FPDF
+                    from db_supabase import get_po_sequence, get_customer
 
-            if st.button("Generate PO"):
-                pdf_file = generate_po_pdf(order_date_sql, customer_id, pickup_date_sql)
-                with open(pdf_file, "rb") as f:
-                    st.download_button("Download PO PDF", data=f, file_name=pdf_file, mime="application/pdf")
+                    # --- Generate PO Number ---
+                    seq = get_po_sequence(order_date_sql)
+                    po_number = f"PO-{order_date_sql.replace('-', '')}-{seq:03d}"
+
+                    # --- Vendor Info ---
+                    vendor = {
+                        "name": "KPrime Food Solutions",
+                        "address": "Blk 3 Lot 5 West Wing Villas, North Belton QC",
+                        "phone": "+63 995 744 9953",
+                        "email": "kprimefoodinc@gmail.com"
+                    }
+
+                    # --- Buyer Info ---
+                    customer = get_customer(customer_id)
+                    buyer = {
+                        "name": customer.get("name", ""),
+                        "address": customer.get("address", ""),
+                        "phone": customer.get("phone", ""),
+                        "email": customer.get("email", "")
+                    }
+                    safe_name = buyer["name"].replace(" ", "_").replace("/", "_")
+                    filename = f"PO_{order_date_sql.replace('-', '')}_{safe_name}.pdf"
+
+                    # --- Build PDF ---
+                    pdf = FPDF()
+                    pdf.add_page()
+                    pdf.image("KPrime.jpg", x=10, y=8, w=30)
+
+                    pdf.set_font("Arial", 'B', 14)
+                    pdf.cell(0, 10, vendor["name"], ln=True, align="C")
+                    pdf.set_font("Arial", size=10)
+                    pdf.multi_cell(0, 5, f"{vendor['address']}\nPhone: {vendor['phone']}\nEmail: {vendor['email']}", align="C")
+                    pdf.ln(10)
+
+                    pdf.set_font("Arial", 'B', 12)
+                    pdf.cell(0, 10, "Purchase Order", ln=True, align="C")
+                    pdf.set_font("Arial", size=10)
+                    pdf.cell(0, 10, f"PO Number: {po_number}", ln=True)
+                    pdf.cell(0, 10, f"Order Date: {order_date_sql}", ln=True)
+                    #pdf.cell(0, 10, f"Pickup Date: {pickup_date_sql}", ln=True)
+                    pdf.ln(10)
+
+                    # Table header
+                    pdf.set_font("Arial", 'B', 10)
+                    pdf.cell(20, 10, "No.", 1, align="C")
+                    pdf.cell(80, 10, "Description", 1, align="L")
+                    pdf.cell(30, 10, "Qty", 1, align="C")
+                    pdf.cell(30, 10, "Unit Price", 1, align="R")
+                    pdf.cell(30, 10, "Total", 1, align="R")
+                    pdf.ln()
+
+                    # Table rows
+                    pdf.set_font("Arial", size=10)
+                    subtotal = 0
+                    for idx, row in sales_df[sales_df['date'] == order_date].iterrows():
+                        total = row["quantity"] * row["selling_price"]
+                        subtotal += total
+                        pdf.cell(20, 10, str(idx+1), 1, align="C")
+                        pdf.cell(80, 10, str(row.get("item_name", "")), 1, align="L")
+                        pdf.cell(30, 10, str(row.get("quantity", "")), 1, align="C")
+                        pdf.cell(30, 10, f"{row.get('selling_price', 0):,.2f}", 1, align="R")
+                        pdf.cell(30, 10, f"{total:,.2f}", 1, align="R")
+                        pdf.ln()
+
+                    pdf.ln(5)
+                    pdf.cell(0, 10, f"Subtotal: PHP {subtotal:,.2f}", ln=True, align="R")
+                    pdf.cell(0, 10, "GST: PHP 0.00 (No GST)", ln=True, align="R")
+                    pdf.cell(0, 10, f"Total Amount: PHP {subtotal:,.2f}", ln=True, align="R")
+                    pdf.ln(10)
+
+                    pdf.cell(0, 10, f"Pickup Date: {pickup_date_sql}", ln=True)
+                    pdf.ln(20)
+                    pdf.cell(0, 10, "Authorized By: ____________________", ln=True)
+
+                    pdf_bytes = bytes(pdf.output(dest="S"))
+                    st.download_button(
+                        "Download PO PDF",
+                        data=pdf_bytes,
+                        file_name=filename,
+                        mime="application/pdf"
+                    )
 
     # ---------------- RECORD SALE ----------------
-    ## Added customer id dropdown
     elif menu == "Record Sale":
         st.title("Record Sale")
         items_df = view_items()
         customers_df = view_customers()
-
         if items_df.empty:
             st.warning("No items available for sale.")
         elif customers_df.empty:
             st.warning("No customers available. Please add a customer first.")
         else:
-            # Build display labels: "<item_id> - <item_name>"
-            items_df["display"] = items_df.apply(
-                lambda row: f"{row['item_id']} - {row['item_name']}", axis=1
-            )
-
-            # Item selection
-            item_display = st.selectbox(
-                "Select Item",
-                ["Select item"] + items_df["display"].tolist()
-            )
-
-            total_qty = 0
+            items_df["display"] = items_df.apply(lambda row: f"{row['item_id']} - {row['item_name']}", axis=1)
+            item_display = st.selectbox("Select Item", ["Select item"] + items_df["display"].tolist())
             selected_item_id, selected_item_name = None, None
             if item_display != "Select item":
                 selected_item_id = int(item_display.split(" - ")[0])
                 selected_item_name = item_display.split(" - ")[1]
-
-            # Customer selection
             customer_label = st.selectbox(
                 "Select Customer",
                 ["Select customer"] + customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1).tolist()
             )
-            if customer_label == "Select customer":
-                st.warning("Please select a valid customer.")
-            else:
+            if customer_label != "Select customer":
                 customer_id = int(customer_label.split(" - ")[0])
                 customer_name = customer_label.split(" - ")[1]
                 st.success(f"Selected customer: ID={customer_id}, Name={customer_name}")
-
-            # Quantity input
-            quantity = st.number_input("Quantity Sold", min_value=1)
-
-            if customer_label != "Select customer" and item_display != "Select item":
-                total_qty = get_total_qty(selected_item_name)
-                st.info(f"Stock Currently On Hand: {total_qty}")
-                if total_qty < quantity and quantity != 0:
-                    st.error("Not enough stock")
-                # Lookup tiered price
-                conn = get_connection()
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT price_per_unit 
-                    FROM pricing_tiers
-                    WHERE item_id = ?
-                    AND min_qty <= ?
-                    AND (max_qty IS NULL OR ? <= max_qty)
-                    ORDER BY min_qty DESC
-                    LIMIT 1
-                """, (selected_item_id, quantity, quantity))
-                tier = cursor.fetchone()
-                conn.close()
-
-                if tier == None:
-                    st.warning("No pricing tier found for this item/quantity.")
-                    price_per_unit = 0.00
-                else:
-                    price_per_unit = tier["price_per_unit"]
-                
-                auto_total = quantity * price_per_unit
-                if total_qty >= quantity:
-                    st.info(f"Tiered Price per Unit: PHP {price_per_unit:,.2f}")
-                    st.info(f"Calculated Total Sale: PHP {auto_total:,.2f}")
-
-                # Override option
-                use_override = st.checkbox("Override Per Unit amount?")
-                override_total = None
-                if use_override:
-                    override_total = st.number_input("Enter custom per unit price", min_value=0.0, format="%.2f")
-
+                quantity = st.number_input("Quantity Sold", min_value=1)
                 if st.button("Record Sale"):
-                    msg = record_sale(selected_item_id, quantity, st.session_state.username, customer_id, override_total)
-                    st.subheader("Sales Records")
-                    sales_df = view_sales_by_customer(customer_id)
-                    if not sales_df.empty:
-                        paged_sales, total_pages = paginate_dataframe(sales_df, page_size=100)
-                        st.write(f"Showing {len(paged_sales)} rows (Page size: 100)")
-
-                        # ✅ Format selling_price and total_sale with commas and 2 decimals
-                        styled_sales = paged_sales.style.format({
-                            "selling_price": "{:,.2f}",
-                            "total_sale": "{:,.2f}",
-                            "cost": "{:,.2f}",
-                            "profit": "{:,.2f}"
-                        })
-                        st.dataframe(styled_sales, width='stretch')
-
-                        csv_sales = sales_df.to_csv(index=False)
-                        st.download_button("Download Sales CSV", data=csv_sales, file_name="sales.csv", mime="text/csv")
-                    else:
-                        st.info("No sales recorded yet.")
+                    msg = record_sale(selected_item_id, quantity, st.session_state.username, customer_id)
                     st.success(msg)
-
 
     # ---------------- PROFIT/LOSS REPORT ----------------
     elif menu == "Profit/Loss Report":
@@ -1578,7 +795,6 @@ elif st.session_state.logged_in:
             st.dataframe(paged_sales)
             csv_sales = sales_df.to_csv(index=False)
             st.download_button("Download Sales CSV", data=csv_sales, file_name="sales.csv", mime="text/csv")
-## Aileen Added
 
     # ---------------- CUSTOMER SOA ----------------
     elif menu == "Customer Statement of Account":
@@ -1587,7 +803,6 @@ elif st.session_state.logged_in:
         if customers_df.empty:
             st.warning("No customers found.")
         else:
-            # Customer selection
             customer_label = st.selectbox(
                 "Select Customer",
                 customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
@@ -1595,41 +810,27 @@ elif st.session_state.logged_in:
             customer_id = int(customer_label.split(" - ")[0])
             customer_name = customer_label.split(" - ")[1]
 
-            # --- Default start and end of current month ---
             today = date.today()
             start_of_month = today.replace(day=1)
             last_day = calendar.monthrange(today.year, today.month)[1]
             end_of_month = today.replace(day=last_day)
 
-            # Date filters with defaults
             start_date = st.date_input("Start Date", value=start_of_month)
             end_date = st.date_input("End Date", value=end_of_month)
 
-            # Fetch filtered sales data
-            def view_sales_by_customer_and_date(customer_id, start_date=None, end_date=None):
-                conn = get_connection()
-                if start_date and end_date:
-                    query = """
-                    SELECT date, item_id, item_name, quantity, selling_price, total_sale, overridden FROM sales
-                    WHERE customer_id = ? AND date BETWEEN ? AND ?
-                    """
-                    df = pd.read_sql_query(query, conn, params=(customer_id, start_date, end_date))
-                else:
-                    query = "SELECT date, item_id, item_name, quantity, selling_price, total_sale, overridden FROM sales WHERE customer_id = ?"
-                    df = pd.read_sql_query(query, conn, params=(customer_id,))
-                conn.close()
-                return df
+            # Supabase query for sales by customer and date
+            from db_supabase import supabase
+            query = supabase.table("sales").select("*").eq("customer_id", customer_id)
+            query = query.gte("date", str(start_date)).lte("date", str(end_date))
+            res = query.execute()
+            sales_customer = pd.DataFrame(res.data)
 
-            # Display filtered table
-            sales_customer = view_sales_by_customer_and_date(customer_id, start_date, end_date)
             if sales_customer.empty:
                 st.warning("No sales records found for this customer in the selected period.")
             else:
                 st.subheader("Sales Records of Selected Customer")
                 paged_sales_customer, total_pages = paginate_dataframe(sales_customer, page_size=20)
                 st.write(f"Showing {len(paged_sales_customer)} rows (Page size: 20)")
-
-                # ✅ Format selling_price and total_sale with commas and 2 decimals
                 styled_sales = paged_sales_customer.style.format({
                     "selling_price": "{:,.2f}",
                     "total_sale": "{:,.2f}",
@@ -1637,43 +838,96 @@ elif st.session_state.logged_in:
                     "profit": "{:,.2f}"
                 })
                 st.dataframe(styled_sales, width='stretch')
-
-                # Download CSV
                 csv_sales = sales_customer.to_csv(index=False)
                 st.download_button("Download Sales CSV", data=csv_sales, file_name="sales_customer.csv", mime="text/csv")
 
-                # Generate SOA PDF
                 if st.button("Generate SOA"):
-                    pdf_file = generate_soa_pdf(customer_name, customer_id, start_date, end_date, sales_customer)
-                    with open(pdf_file, "rb") as f:
-                        st.download_button("Download SOA PDF", data=f, file_name=pdf_file, mime="application/pdf")
+                    from fpdf import FPDF
 
-    # --- New Menu Options ---
-    # --- Enhanced View Price History with Pagination and CSV Export ---
+                    filename = f"SOA_{customer_id}_{start_date}_{end_date}.pdf"
+                    pdf = FPDF()
+                    pdf.add_page()
+
+                    # --- Logo ---
+                    # Place your logo image (PNG/JPG) in your project folder
+                    # Adjust x, y, width as needed
+                    pdf.image("KPrime.jpg", x=10, y=8, w=30)
+
+                    # --- Company Name & Address ---
+                    pdf.set_font("Arial", 'B', 14)
+                    pdf.cell(0, 10, "KPrime Food Solutions", ln=True, align="C")
+
+                    pdf.set_font("Arial", size=10)
+                    pdf.multi_cell(0, 5, "Blk 3 Lot 5 West Wing Villas, North Belton QC\nPhone: +63 995 744 9953\nEmail: kprimefoodinc@gmail.com", align="C")
+                    pdf.ln(10)  # Add some spacing before the document title
+
+                    pdf.set_font("Arial", size=12)
+
+                    # Header
+                    pdf.cell(200, 10, txt=f"Statement of Account", ln=True, align="C")
+                    pdf.cell(200, 10, txt=f"Customer: {customer_name} (ID: {customer_id})", ln=True)
+                    pdf.cell(200, 10, txt=f"Period: {start_date} to {end_date}", ln=True)
+                    pdf.ln(10)
+
+                    # Table header
+                    pdf.set_font("Arial", 'B', 10)
+                    pdf.cell(20, 10, "Date", 1, align="C")
+                    pdf.cell(60, 10, "Item", 1, align="L")
+                    pdf.cell(20, 10, "Qty", 1, align="C")
+                    pdf.cell(40, 10, "Total Sale", 1, align="R")
+                    pdf.cell(40, 10, "Profit", 1, align="R")
+                    pdf.ln()
+
+                    # Table rows
+                    pdf.set_font("Arial", size=10)
+                    for _, row in sales_customer.iterrows():
+                        pdf.cell(20, 10, str(row.get("date", "")), 1, align="C")
+                        pdf.cell(60, 10, str(row.get("item_name", "")), 1, align="L")
+                        pdf.cell(20, 10, str(row.get("quantity", "")), 1, align="C")
+                        pdf.cell(40, 10, f"{row.get('total_sale', 0):,.2f}", 1, align="R")
+                        pdf.cell(40, 10, f"{row.get('profit', 0):,.2f}", 1, align="R")
+                        pdf.ln()
+
+                    # ✅ Save PDF properly
+                    pdf.output(filename)
+
+                    # ✅ Open in binary mode for download
+                    pdf_bytes = bytes(pdf.output(dest="S"))
+                    st.download_button("Download SOA PDF", data=pdf_bytes, file_name=filename, mime="application/pdf")
+                    #with open(filename, "rb") as f:
+                    #    st.download_button("Download SOA PDF", data=f.read(), file_name=filename, mime="application/pdf")
+
+    # ---------------- VIEW PRICE HISTORY ----------------
     elif menu == "View Price History2":
         st.title("Price History")
-        conn = get_connection()
-        df = pd.read_sql_query('SELECT ph.timestamp, i.item, ph.old_quantity, ph.new_price_quantity, ph.old_unit_cost, ph.old_selling_price, ph.new_unit_cost, ph.new_selling_price, ph.changed_by FROM price_history ph JOIN items i ON ph.item_id = i.id ORDER BY ph.timestamp DESC', conn)
-        conn.close()
+        from db_supabase import supabase
+        res = supabase.table("price_history").select("*").order("timestamp", desc=True).execute()
+        df = pd.DataFrame(res.data)
         if df.empty:
             st.warning("No price changes recorded")
         else:
             paged_df, total_pages = paginate_dataframe(df, page_size=20)
             st.write(f"Showing {len(paged_df)} rows (Page size: 20)")
-            st.dataframe(paged_df.style.format({"old_unit_cost": "{:,.2f}", "old_selling_price": "{:,.2f}", "new_unit_cost": "{:,.2f}", "new_selling_price": "{:,.2f}"}))
+            st.dataframe(paged_df.style.format({
+                "old_unit_cost": "{:,.2f}",
+                "old_selling_price": "{:,.2f}",
+                "new_unit_cost": "{:,.2f}",
+                "new_selling_price": "{:,.2f}"
+            }))
             csv_data = df.to_csv(index=False)
             st.download_button("Download Price History CSV", data=csv_data, file_name="price_history.csv", mime="text/csv")
 
-    # --- Enhanced Price Change Impact Report with Pagination and CSV Export ---
+    # ---------------- PRICE CHANGE IMPACT REPORT ----------------
     elif menu == "Price Change Impact Report2":
         st.title("Price Change Impact Report")
         items_df = view_items()
         if items_df.empty:
             st.warning("No items available")
         else:
-            item = st.selectbox("Select Item", items_df['item'])
-            conn = get_connection()
-            history_df = pd.read_sql_query('SELECT * FROM price_history WHERE item_id=(SELECT id FROM items WHERE item=?) ORDER BY timestamp', conn, params=(item,))
+            item = st.selectbox("Select Item", items_df['item_name'])
+            from db_supabase import supabase
+            history_res = supabase.table("price_history").select("*").eq("item_id", item).order("timestamp").execute()
+            history_df = pd.DataFrame(history_res.data)
             if history_df.empty:
                 st.warning("No price changes recorded for this item")
             else:
@@ -1685,11 +939,3 @@ elif st.session_state.logged_in:
                 st.download_button("Download Impact Report CSV", data=csv_history, file_name="impact_report.csv", mime="text/csv")
                 for idx, row in history_df.iterrows():
                     st.markdown(f"### Change on {row['timestamp']}: {row['old_selling_price']} → {row['new_selling_price']}")
-                    before_sales = pd.read_sql_query('SELECT * FROM sales WHERE item=? AND date<?', conn, params=(item, row['timestamp']))
-                    after_sales = pd.read_sql_query('SELECT * FROM sales WHERE item=? AND date>=?', conn, params=(item, row['timestamp']))
-                    st.write("**Before Change:**")
-                    st.dataframe(before_sales)
-                    st.write("**After Change:**")
-                    st.dataframe(after_sales)
-            conn.close()
-
