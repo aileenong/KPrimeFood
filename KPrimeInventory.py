@@ -650,6 +650,7 @@ elif st.session_state.logged_in:
    # ---------------- GENERATE PURCHASE ORDER ----------------
     elif menu == "Generate Purchase Order":
         st.title("Generate Purchase Order (PO)")
+        from fpdf.enums import XPos, YPos
         customers_df = view_customers()
         if customers_df.empty:
             st.warning("No customers found.")
@@ -705,22 +706,22 @@ elif st.session_state.logged_in:
                     pdf.add_page()
                     pdf.image("KPrime.jpg", x=10, y=8, w=30)
 
-                    pdf.set_font("Arial", 'B', 14)
-                    pdf.cell(0, 10, vendor["name"], ln=True, align="C")
-                    pdf.set_font("Arial", size=10)
+                    pdf.set_font("Helvetica", 'B', 14)
+                    pdf.cell(0, 10, vendor["name"], new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                    pdf.set_font("Helvetica", size=10)
                     pdf.multi_cell(0, 5, f"{vendor['address']}\nPhone: {vendor['phone']}\nEmail: {vendor['email']}", align="C")
                     pdf.ln(10)
 
-                    pdf.set_font("Arial", 'B', 12)
-                    pdf.cell(0, 10, "Purchase Order", ln=True, align="C")
-                    pdf.set_font("Arial", size=10)
-                    pdf.cell(0, 10, f"PO Number: {po_number}", ln=True)
-                    pdf.cell(0, 10, f"Order Date: {order_date_sql}", ln=True)
-                    #pdf.cell(0, 10, f"Pickup Date: {pickup_date_sql}", ln=True)
+                    pdf.set_font("Helvetica", 'B', 12)
+                    pdf.cell(0, 10, "Purchase Order", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                    pdf.set_font("Helvetica", size=10)
+                    pdf.cell(0, 10, f"PO Number: {po_number}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                    pdf.cell(0, 10, f"Order Date: {order_date_sql}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                    #pdf.cell(0, 10, f"Pickup Date: {pickup_date_sql}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
                     pdf.ln(10)
 
                     # Table header
-                    pdf.set_font("Arial", 'B', 10)
+                    pdf.set_font("Helvetica", 'B', 10)
                     pdf.cell(20, 10, "No.", 1, align="C")
                     pdf.cell(80, 10, "Description", 1, align="L")
                     pdf.cell(30, 10, "Qty", 1, align="C")
@@ -729,7 +730,7 @@ elif st.session_state.logged_in:
                     pdf.ln()
 
                     # Table rows
-                    pdf.set_font("Arial", size=10)
+                    pdf.set_font("Helvetica", size=10)
                     subtotal = 0
                     for idx, row in sales_df[sales_df['date'] == order_date].iterrows():
                         total = row["quantity"] * row["selling_price"]
@@ -742,16 +743,27 @@ elif st.session_state.logged_in:
                         pdf.ln()
 
                     pdf.ln(5)
-                    pdf.cell(0, 10, f"Subtotal: PHP {subtotal:,.2f}", ln=True, align="R")
-                    pdf.cell(0, 10, "GST: PHP 0.00 (No GST)", ln=True, align="R")
-                    pdf.cell(0, 10, f"Total Amount: PHP {subtotal:,.2f}", ln=True, align="R")
+                    pdf.cell(0, 10, f"Subtotal: PHP {subtotal:,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+                    pdf.cell(0, 10, "GST: PHP 0.00 (No GST)", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+                    pdf.cell(0, 10, f"Total Amount: PHP {subtotal:,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
                     pdf.ln(10)
 
-                    pdf.cell(0, 10, f"Pickup Date: {pickup_date_sql}", ln=True)
+                    pdf.cell(0, 10, f"Pickup Date: {pickup_date_sql}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
                     pdf.ln(20)
-                    pdf.cell(0, 10, "Authorized By: ____________________", ln=True)
+                    pdf.cell(0, 10, "Authorized By: ____________________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-                    pdf_bytes = bytes(pdf.output(dest="S"))
+                    #pdf_bytes = bytes(pdf.output(dest="S"))
+
+                    #pdf_bytes = pdf.output(dest="bytes")
+                    #pdf_bytes = bytes(pdf_bytes)   # Convert bytearray → bytes
+                    #st.download_button(
+                    #    "Download PO PDF",
+                    #    data=pdf_bytes,
+                    #    file_name=filename,
+                    #    mime="application/pdf"
+                    #)
+
+                    pdf_bytes = bytes(pdf.output())  # no dest argument
                     st.download_button(
                         "Download PO PDF",
                         data=pdf_bytes,
@@ -877,6 +889,7 @@ elif st.session_state.logged_in:
     # ---------------- CUSTOMER SOA ----------------
     elif menu == "Customer Statement of Account":
         st.title("Customer Statement of Account")
+        from fpdf.enums import XPos, YPos
         customers_df = view_customers()
         if customers_df.empty:
             st.warning("No customers found.")
@@ -902,6 +915,11 @@ elif st.session_state.logged_in:
             query = query.gte("date", str(start_date)).lte("date", str(end_date))
             res = query.execute()
             sales_customer = pd.DataFrame(res.data)
+
+            # Ensure 'date' is the first column
+            if not sales_customer.empty and "date" in sales_customer.columns:
+                cols = ["date"] + [c for c in sales_customer.columns if c != "date"]
+                sales_customer = sales_customer[cols]
 
             if sales_customer.empty:
                 st.warning("No sales records found for this customer in the selected period.")
@@ -932,23 +950,23 @@ elif st.session_state.logged_in:
                     pdf.image("KPrime.jpg", x=10, y=8, w=30)
 
                     # --- Company Name & Address ---
-                    pdf.set_font("Arial", 'B', 14)
-                    pdf.cell(0, 10, "KPrime Food Solutions", ln=True, align="C")
+                    pdf.set_font("Helvetica", 'B', 14)
+                    pdf.cell(0, 10, "KPrime Food Solutions", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
 
-                    pdf.set_font("Arial", size=10)
+                    pdf.set_font("Helvetica", size=10)
                     pdf.multi_cell(0, 5, "Blk 3 Lot 5 West Wing Villas, North Belton QC\nPhone: +63 995 744 9953\nEmail: kprimefoodinc@gmail.com", align="C")
                     pdf.ln(10)  # Add some spacing before the document title
 
-                    pdf.set_font("Arial", size=12)
+                    pdf.set_font("Helvetica", size=12)
 
                     # Header
-                    pdf.cell(200, 10, txt=f"Statement of Account", ln=True, align="C")
-                    pdf.cell(200, 10, txt=f"Customer: {customer_name} (ID: {customer_id})", ln=True)
-                    pdf.cell(200, 10, txt=f"Period: {start_date} to {end_date}", ln=True)
+                    pdf.cell(200, 10, text=f"Statement of Account", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                    pdf.cell(200, 10, text=f"Customer: {customer_name} (ID: {customer_id})", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                    pdf.cell(200, 10, text=f"Period: {start_date} to {end_date}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
                     pdf.ln(10)
 
                     # Table header
-                    pdf.set_font("Arial", 'B', 10)
+                    pdf.set_font("Helvetica", 'B', 10)
                     pdf.cell(20, 10, "Date", 1, align="C")
                     pdf.cell(60, 10, "Item", 1, align="L")
                     pdf.cell(20, 10, "Qty", 1, align="C")
@@ -957,7 +975,7 @@ elif st.session_state.logged_in:
                     pdf.ln()
 
                     # Table rows
-                    pdf.set_font("Arial", size=10)
+                    pdf.set_font("Helvetica", size=10)
                     for _, row in sales_customer.iterrows():
                         pdf.cell(20, 10, str(row.get("date", "")), 1, align="C")
                         pdf.cell(60, 10, str(row.get("item_name", "")), 1, align="L")
@@ -970,8 +988,22 @@ elif st.session_state.logged_in:
                     pdf.output(filename)
 
                     # ✅ Open in binary mode for download
-                    pdf_bytes = bytes(pdf.output(dest="S"))
-                    st.download_button("Download SOA PDF", data=pdf_bytes, file_name=filename, mime="application/pdf")
+                    #pdf_bytes = bytes(pdf.output(dest="S"))
+
+                    #pdf_bytes = pdf.output(dest="bytes")
+                    #pdf_bytes = bytes(pdf_bytes)   # Convert bytearray → bytes
+
+                    #st.download_button("Download SOA PDF", data=pdf_bytes, file_name=filename, mime="application/pdf")
+
+                    pdf_bytes = bytes(pdf.output())  # no dest argument
+                    st.download_button(
+                        "Download SOA PDF",
+                        data=pdf_bytes,
+                        file_name=filename,
+                        mime="application/pdf"
+                    )
+
+
                     #with open(filename, "rb") as f:
                     #    st.download_button("Download SOA PDF", data=f.read(), file_name=filename, mime="application/pdf")
 
