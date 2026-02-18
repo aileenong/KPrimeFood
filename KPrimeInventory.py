@@ -34,7 +34,10 @@ from db_supabase import (
     delete_item,
     delete_all_inventory,
     get_total_qty,
-    record_sale
+    record_sale,
+    get_tiered_price,
+    get_po_sequence,
+    get_customer    
 )
 
 # ---------------- SESSION STATE INIT ----------------
@@ -756,34 +759,101 @@ elif st.session_state.logged_in:
                         mime="application/pdf"
                     )
 
-    # ---------------- RECORD SALE ----------------
     elif menu == "Record Sale":
         st.title("Record Sale")
         items_df = view_items()
         customers_df = view_customers()
+
         if items_df.empty:
             st.warning("No items available for sale.")
         elif customers_df.empty:
             st.warning("No customers available. Please add a customer first.")
         else:
-            items_df["display"] = items_df.apply(lambda row: f"{row['item_id']} - {row['item_name']}", axis=1)
-            item_display = st.selectbox("Select Item", ["Select item"] + items_df["display"].tolist())
+            # Build display labels: "<item_id> - <item_name>"
+            items_df["display"] = items_df.apply(
+                lambda row: f"{row['item_id']} - {row['item_name']}", axis=1
+            )
+
+            # Item selection
+            item_display = st.selectbox(
+                "Select Item",
+                ["Select item"] + items_df["display"].tolist()
+            )
+
             selected_item_id, selected_item_name = None, None
             if item_display != "Select item":
                 selected_item_id = int(item_display.split(" - ")[0])
                 selected_item_name = item_display.split(" - ")[1]
+
+            # Customer selection
             customer_label = st.selectbox(
                 "Select Customer",
                 ["Select customer"] + customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1).tolist()
             )
-            if customer_label != "Select customer":
+
+            if customer_label == "Select customer":
+                st.warning("Please select a valid customer.")
+            else:
                 customer_id = int(customer_label.split(" - ")[0])
                 customer_name = customer_label.split(" - ")[1]
                 st.success(f"Selected customer: ID={customer_id}, Name={customer_name}")
+
+                # Quantity input
                 quantity = st.number_input("Quantity Sold", min_value=1)
-                if st.button("Record Sale"):
-                    msg = record_sale(selected_item_id, quantity, st.session_state.username, customer_id)
-                    st.success(msg)
+
+                if item_display != "Select item":
+                    # Get stock on hand
+                    total_qty = get_total_qty(selected_item_name)
+                    st.info(f"Stock Currently On Hand: {total_qty}")
+
+                    if total_qty < quantity and quantity != 0:
+                        st.error("Not enough stock")
+
+                    # ✅ Call helper function from db_supabase.py
+                    price_per_unit = get_tiered_price(selected_item_id, quantity)
+
+                    if price_per_unit is None:
+                        st.warning("No pricing tier found for this item/quantity.")
+                        price_per_unit = 0.00
+
+                    auto_total = quantity * price_per_unit
+                    if total_qty >= quantity:
+                        st.info(f"Tiered Price per Unit: PHP {price_per_unit:,.2f}")
+                        st.info(f"Calculated Total Sale: PHP {auto_total:,.2f}")
+
+                    # Override option
+                    use_override = st.checkbox("Override Per Unit amount?")
+                    override_total = None
+                    if use_override:
+                        override_total = st.number_input("Enter custom per unit price", min_value=0.0, format="%.2f")
+
+                    if st.button("Record Sale"):
+                        msg = record_sale(
+                            selected_item_id,
+                            quantity,
+                            st.session_state.username,
+                            customer_id,
+                            override_total
+                        )
+                        st.subheader("Sales Records")
+                        sales_df = view_sales_by_customer(customer_id)
+                        if not sales_df.empty:
+                            paged_sales, total_pages = paginate_dataframe(sales_df, page_size=100)
+                            st.write(f"Showing {len(paged_sales)} rows (Page size: 100)")
+
+                            styled_sales = paged_sales.style.format({
+                                "selling_price": "{:,.2f}",
+                                "total_sale": "{:,.2f}",
+                                "cost": "{:,.2f}",
+                                "profit": "{:,.2f}"
+                            })
+                            st.dataframe(styled_sales, width='stretch')
+
+                            csv_sales = sales_df.to_csv(index=False)
+                            st.download_button("Download Sales CSV", data=csv_sales, file_name="sales.csv", mime="text/csv")
+                        else:
+                            st.info("No sales recorded yet.")
+                        st.success(msg)
 
     # ---------------- PROFIT/LOSS REPORT ----------------
     elif menu == "Profit/Loss Report":

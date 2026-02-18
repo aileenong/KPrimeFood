@@ -229,3 +229,20 @@ def record_sale(item_id, quantity, user, customer_id, override_total=None):
     }).execute()
 
     return f"Sale recorded. Deduction details:\n" + "\n".join(deduction_log)
+
+def get_tiered_price(item_id: int, quantity: int):
+    """
+    Fetch the correct tiered price per unit for an item/quantity.
+    Returns None if no tier is found.
+    """
+    response = supabase.table("pricing_tiers").select("price_per_unit") \
+        .eq("item_id", item_id) \
+        .lte("min_qty", quantity) \
+        .or_(f"max_qty.is.null,max_qty.gte.{quantity}") \
+        .order("min_qty", desc=True) \
+        .limit(1) \
+        .execute()
+
+    if not response.data:
+        return None
+    return response.data[0]["price_per_unit"]
