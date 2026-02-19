@@ -37,7 +37,11 @@ from db_supabase import (
     record_sale,
     get_tiered_price,
     get_po_sequence,
-    get_customer    
+    get_customer,
+    get_pricing_tiers, save_pricing_tier, delete_pricing_tier,
+    upload_tiered_pricing_to_db,
+    get_customers, save_customer, delete_customer,
+    get_sales_by_customer
 )
 
 # ---------------- SESSION STATE INIT ----------------
@@ -76,6 +80,63 @@ def logout():
 
 # ----------------- Manage Pricing Tiers -----------------
 def manage_pricing_tiers():
+    st.title("Manage Pricing Tiers")
+
+    items_df = view_items()
+    if items_df.empty:
+        st.warning("No items found.")
+        return
+
+    item_label = st.selectbox(
+        "Select Item",
+        items_df.apply(lambda row: f"{row['item_id']} - {row['item_name']}", axis=1)
+    )
+    item_id = int(item_label.split(" - ")[0])
+    item_name = item_label.split(" - ")[1]
+
+    # Show existing tiers
+    tiers = get_pricing_tiers(item_id)
+    if not tiers.empty:
+        st.subheader("Existing Pricing Tiers")
+        tiers["max_qty"] = tiers["max_qty"].fillna("∞")
+        tiers["price_per_unit"] = tiers["price_per_unit"].map(lambda x: f"{x:.2f}")
+        st.dataframe(tiers, width='stretch')
+    else:
+        st.info("No pricing tiers defined for this item yet.")
+
+    st.markdown("---")
+
+    # Add/Update section
+    with st.expander("➕ Add / Update Pricing Tier", expanded=False):
+        min_qty = st.number_input("Minimum Quantity", min_value=1)
+        max_qty = st.number_input("Maximum Quantity (0 = unlimited)", min_value=0)
+        price_per_unit = st.number_input("Price per Unit", min_value=0.0, format="%.2f")
+        label = st.text_input("Tier Label (optional)", value=item_name)
+
+        if st.button("Save Tier"):
+            result = save_pricing_tier(item_id, min_qty, max_qty, price_per_unit, label)
+            if result == "updated":
+                st.success(f"Updated existing pricing tier for {item_name}.")
+            else:
+                st.success("Added new Pricing tier successfully!")
+            st.rerun()
+
+    # Delete section
+    if not tiers.empty:
+        with st.expander("🗑️ Delete a Tier", expanded=False):
+            st.subheader("Delete a Tier")
+            tier_ids = ["Select Tier to Delete"] + [
+                f"{t['id']} (min {t['min_qty']}, max {t['max_qty'] if t['max_qty'] is not None else '∞'})"
+                for _, t in tiers.iterrows()
+            ]
+            tier_to_delete = st.selectbox("Select Tier to Delete", tier_ids)
+            if st.button("Delete Tier") and tier_to_delete != "Select Tier to Delete":
+                tier_id = int(tier_to_delete.split()[0])
+                delete_pricing_tier(tier_id)
+                st.success("Tier deleted successfully!")
+                st.rerun()
+
+def manage_pricing_tiers2():
     st.title("Manage Pricing Tiers")
 
     # Select item first
@@ -192,6 +253,27 @@ def manage_pricing_tiers():
 
 # ---------------- Upload Tiered Pricing ----------------
 def upload_tiered_pricing(uploaded_file):
+    if uploaded_file is None:
+        st.error("No file uploaded.")
+        return
+
+    # Determine file type and read accordingly
+    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+    if file_ext == '.csv':
+        df = pd.read_csv(uploaded_file)
+    elif file_ext in ['.xlsx', '.xls']:
+        df = pd.read_excel(uploaded_file, engine='openpyxl' if file_ext == '.xlsx' else 'xlrd')
+    else:
+        raise ValueError("Unsupported file format. Please upload a CSV or Excel file.")
+
+    skipped_rows = upload_tiered_pricing_to_db(df)
+
+    if skipped_rows:
+        st.warning(f"Skipped rows with invalid item_id(s): {skipped_rows}")
+    else:
+        st.success("Pricing Tiers updated or inserted successfully!")
+
+def upload_tiered_pricing2(uploaded_file):
     if uploaded_file is None:
         st.error("No file uploaded.")
         return
@@ -539,6 +621,68 @@ elif st.session_state.logged_in:
     # ---------------- MANAGE CUSTOMERS ----------------
     elif menu == "Manage Customers":
         st.title("Customer List")
+        customers_df = get_customers()
+
+        if customers_df.empty:
+            st.warning("No customers found.")
+        else:
+            st.subheader("Current Customers")
+            st.dataframe(customers_df[['id','name','phone','email','address']], width='stretch')
+
+        with st.expander("➕ Add / Update Customers", expanded=False):
+            if not customers_df.empty:
+                customer_options = ["Add New"] + [f"{row['id']} - {row['name']}" for _, row in customers_df.iterrows()]
+            else:
+                customer_options = ["Add New"]
+
+            selected_customer = st.selectbox("Select Customer", customer_options)
+            if selected_customer != "Add New":
+                selected_customer_id = int(selected_customer.split(" - ")[0])
+                selected_customer_name = selected_customer.split(" - ")[1]
+                customer_rows = customers_df[customers_df['name'] == selected_customer_name]
+
+                if not customer_rows.empty:
+                    st.info("Existing customer details:")
+                    st.dataframe(customer_rows[['id','name','phone','email','address']])
+                else:
+                    st.warning(f"No records found for customer '{selected_customer_name}'.")
+
+                customer_id = selected_customer_id
+                name = st.text_input("Name", value=selected_customer_name)
+                phone = st.text_input("Contact No", value=customer_rows.iloc[0]['phone'] if not customer_rows.empty else "")
+                email = st.text_input("Email Address", value=customer_rows.iloc[0]['email'] if not customer_rows.empty else "")
+                address = st.text_input("Address", value=customer_rows.iloc[0]['address'] if not customer_rows.empty else "")
+            else:
+                customer_id = None
+                name = st.text_input("Name", value="")
+                phone = st.text_input("Contact No", value="")
+                email = st.text_input("Email Address", value="")
+                address = st.text_input("Address", value="")
+
+            if st.button("Save Customer"):
+                result = save_customer(customer_id, name, phone, email, address)
+                if result == "updated":
+                    st.success(f"Customer '{name}' updated successfully!")
+                else:
+                    st.success(f"Customer '{name}' added successfully!")
+                st.rerun()
+
+        with st.expander("🗑️ Delete a Customer", expanded=False):
+            if customers_df.empty:
+                st.warning("No customers to delete.")
+            else:
+                customers_df['label'] = customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
+                selected_label = st.selectbox("Select Customer to Delete", customers_df['label'])
+                customer_id = int(selected_label.split(" - ")[0])
+                if st.button("Delete Customer"):
+                    delete_customer(customer_id)
+                    st.success(f"Customer with ID {customer_id} deleted successfully!")
+                    st.rerun()
+
+
+
+    elif menu == "Manage Customers2":
+        st.title("Customer List")
         customers_df = view_customers()
         if customers_df.empty:
             st.warning("No customers found.")
@@ -632,6 +776,12 @@ elif st.session_state.logged_in:
             )
             customer_id = int(customer_label.split(" - ")[0])
             sales_df = view_sales_by_customers(customer_id)
+
+            # Ensure 'date' is the first column
+            if not sales_df.empty and "date" in sales_df.columns:
+                cols = ["date"] + [c for c in sales_df.columns if c != "date"]
+                sales_df = sales_df[cols]
+
             if sales_df.empty:
                 st.warning("No sales records found for this customer.")
             else:
@@ -888,6 +1038,105 @@ elif st.session_state.logged_in:
 
     # ---------------- CUSTOMER SOA ----------------
     elif menu == "Customer Statement of Account":
+        st.title("Customer Statement of Account")
+        from fpdf.enums import XPos, YPos
+        customers_df = view_customers()
+
+        if customers_df.empty:
+            st.warning("No customers found.")
+        else:
+            customer_label = st.selectbox(
+                "Select Customer",
+                customers_df.apply(lambda row: f"{row['id']} - {row['name']}", axis=1)
+            )
+            customer_id = int(customer_label.split(" - ")[0])
+            customer_name = customer_label.split(" - ")[1]
+
+            today = date.today()
+            start_of_month = today.replace(day=1)
+            last_day = calendar.monthrange(today.year, today.month)[1]
+            end_of_month = today.replace(day=last_day)
+
+            start_date = st.date_input("Start Date", value=start_of_month)
+            end_date = st.date_input("End Date", value=end_of_month)
+
+            # ✅ Use helper function from db_supabase.py
+            sales_customer = get_sales_by_customer(customer_id, start_date, end_date)
+
+            # Ensure 'date' is the first column
+            if not sales_customer.empty and "date" in sales_customer.columns:
+                cols = ["date"] + [c for c in sales_customer.columns if c != "date"]
+                sales_customer = sales_customer[cols]
+
+            if sales_customer.empty:
+                st.warning("No sales records found for this customer in the selected period.")
+            else:
+                st.subheader("Sales Records of Selected Customer")
+                paged_sales_customer, total_pages = paginate_dataframe(sales_customer, page_size=20)
+                st.write(f"Showing {len(paged_sales_customer)} rows (Page size: 20)")
+                styled_sales = paged_sales_customer.style.format({
+                    "selling_price": "{:,.2f}",
+                    "total_sale": "{:,.2f}",
+                    "cost": "{:,.2f}",
+                    "profit": "{:,.2f}"
+                })
+                st.dataframe(styled_sales, width='stretch')
+
+                csv_sales = sales_customer.to_csv(index=False)
+                st.download_button("Download Sales CSV", data=csv_sales, file_name="sales_customer.csv", mime="text/csv")
+
+                if st.button("Generate SOA"):
+                    from fpdf import FPDF
+
+                    filename = f"SOA_{customer_id}_{start_date}_{end_date}.pdf"
+                    pdf = FPDF()
+                    pdf.add_page()
+
+                    # --- Logo ---
+                    pdf.image("KPrime.jpg", x=10, y=8, w=30)
+
+                    # --- Company Name & Address ---
+                    pdf.set_font("Helvetica", 'B', 14)
+                    pdf.cell(0, 10, "KPrime Food Solutions", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+
+                    pdf.set_font("Helvetica", size=10)
+                    pdf.multi_cell(0, 5, "Blk 3 Lot 5 West Wing Villas, North Belton QC\nPhone: +63 995 744 9953\nEmail: kprimefoodinc@gmail.com", align="C")
+                    pdf.ln(10)
+
+                    pdf.set_font("Helvetica", size=12)
+                    pdf.cell(200, 10, text=f"Statement of Account", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                    pdf.cell(200, 10, text=f"Customer: {customer_name} (ID: {customer_id})", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                    pdf.cell(200, 10, text=f"Period: {start_date} to {end_date}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                    pdf.ln(10)
+
+                    # Table header
+                    pdf.set_font("Helvetica", 'B', 10)
+                    pdf.cell(20, 10, "Date", 1, align="C")
+                    pdf.cell(60, 10, "Item", 1, align="L")
+                    pdf.cell(20, 10, "Qty", 1, align="C")
+                    pdf.cell(40, 10, "Total Sale", 1, align="R")
+                    pdf.cell(40, 10, "Profit", 1, align="R")
+                    pdf.ln()
+
+                    # Table rows
+                    pdf.set_font("Helvetica", size=10)
+                    for _, row in sales_customer.iterrows():
+                        pdf.cell(20, 10, str(row.get("date", "")), 1, align="C")
+                        pdf.cell(60, 10, str(row.get("item_name", "")), 1, align="L")
+                        pdf.cell(20, 10, str(row.get("quantity", "")), 1, align="C")
+                        pdf.cell(40, 10, f"{row.get('total_sale', 0):,.2f}", 1, align="R")
+                        pdf.cell(40, 10, f"{row.get('profit', 0):,.2f}", 1, align="R")
+                        pdf.ln()
+
+                    # ✅ Save PDF properly
+                    pdf.output(filename)
+
+                    # ✅ Get bytes without deprecated dest
+                    pdf_bytes = bytes(pdf.output())
+                    st.download_button("Download SOA PDF", data=pdf_bytes, file_name=filename, mime="application/pdf")
+
+
+    elif menu == "Customer Statement of Account2":
         st.title("Customer Statement of Account")
         from fpdf.enums import XPos, YPos
         customers_df = view_customers()
