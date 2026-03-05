@@ -7,7 +7,7 @@ import os
 import io
 import base64
 import cv2
-from pyzbar.pyzbar import decode
+# from pyzbar.pyzbar import decode
 import datetime
 from datetime import datetime, date
 import calendar
@@ -1297,4 +1297,5 @@ elif st.session_state.logged_in:
                 csv_history = history_df.to_csv(index=False)
                 st.download_button("Download Impact Report CSV", data=csv_history, file_name="impact_report.csv", mime="text/csv")
                 for idx, row in history_df.iterrows():
+
                     st.markdown(f"### Change on {row['timestamp']}: {row['old_selling_price']} → {row['new_selling_price']}")
